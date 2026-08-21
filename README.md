@@ -67,7 +67,7 @@ Two things worth knowing before you point it at something you care about:
 
 ## Building
 
-### macOS
+The same two commands on macOS and on Linux:
 
 ```sh
 git clone https://github.com/ptsochantaris/fatrabbit
@@ -77,22 +77,22 @@ sudo make install            # -> /usr/local/bin/fatrabbit
 ```
 
 `make release` is the build to ship: `-O` and whole-module from the release configuration,
-`-Ounchecked` from the manifest, and full LTO — which `swift build` can only be told about on the
-command line, which is the entire reason this project has a Makefile. Be clear about what LTO is
-worth here, though, because it is not speed: 578 KiB against 635 KiB and no measurable difference in
-run time. On a run that is three quarters device I/O there is nothing for it to win.
+`-Ounchecked` from the manifest, and full LTO. That last one is the entire reason this project has a
+Makefile at all — LTO changes which artifacts the build produces and how the link consumes them, so
+the build system has to know about it, which makes it a flag to `swift build` rather than something a
+package manifest can express.
+
+Be clear about what LTO is worth here, though, because it is not speed. It buys a smaller binary —
+578 KiB against 635 KiB on macOS, 1.59 MiB against 1.75 MiB on Linux — and no measurable difference
+in run time. On a run that is three quarters device I/O there is nothing for it to win.
+
+One wrinkle if you build in a container: the official `swift` images do not ship `make`, so
+`apt-get install -y make` first, or use `swift build -c release` and forgo the LTO.
 
 `swift build -c release` and opening `Package.swift` in Xcode both work fine and produce the larger
 non-LTO binary. Good for editing and debugging; worth knowing before quoting a size from one.
 
-### Linux
-
-```sh
-git clone https://github.com/ptsochantaris/fatrabbit
-cd fatrabbit
-swift build -c release       # -> .build/release/fatrabbit
-sudo install -m 0755 .build/release/fatrabbit /usr/local/bin/fatrabbit
-```
+### Checking the Linux build from a Mac
 
 The Makefile also carries a containerised build, used during the port to check that the Linux half
 of the platform seam still compiles without needing a Linux box to hand:
