@@ -76,6 +76,10 @@ final class Display: EventConsumer, @unchecked Sendable {
 
         var volumeName = ""
         var device = ""
+        /// Which FAT variant, as the engine named it. Worth a place in the title now that a run can
+        /// be any of three: the geometry beside it reads very differently on a 1.4 MB FAT12 floppy
+        /// image than on a 2 TB FAT32 volume, and nothing else on screen says which one this is.
+        var flavour = ""
         var geometry = ""
 
         var phaseName = "Starting"
@@ -185,6 +189,7 @@ final class Display: EventConsumer, @unchecked Sendable {
         case .opened(let geometry):
             let cells = state.withLock { state -> Int in
                 state.frame.volumeName = geometry.label
+                state.frame.flavour = geometry.flavour
                 state.frame.geometry = "\(readableBytes(geometry.byteCount)) in "
                     + "\(geometry.clusterSize / 1024) KiB clusters"
                 return max(1, state.frame.size.columns - 2)
@@ -530,6 +535,9 @@ private extension Display.Frame {
         var parts = ["FATRABBIT"]
         if !volumeName.isEmpty { parts.append(volumeName) }
         parts.append(device)
+        // Ahead of the geometry, since it is what the geometry has to be read in the light of, and
+        // ahead of it in the truncation order a narrow window imposes for the same reason.
+        if !flavour.isEmpty { parts.append(flavour) }
         parts.append(geometry)
         return parts.joined(separator: separator)
     }
