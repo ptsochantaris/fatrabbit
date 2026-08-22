@@ -1,8 +1,6 @@
 # fatrabbit
 
-<p align="center">
-  <img src="Images/logo.webp" width="320" alt="A rabbit behind a contiguous row of dominoes">
-</p>
+<img src="Images/logo.webp" align="right" width="280" hspace="20" alt="A rabbit behind a contiguous row of dominoes">
 
 Defragments a FAT volume in place — FAT12, FAT16 or FAT32 — so that every file and directory ends up
 occupying a single contiguous run, then rewrites the FATs and boot record to match.
