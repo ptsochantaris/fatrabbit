@@ -20,6 +20,8 @@ Written in Swift 6, runs on macOS and Linux, no dependencies.
 
 ## What it does
 
+<img src="Images/screenshot.webp" align="right" width="420" hspace="20" alt="The live block map part way through a run: orange clusters still to move draining into green ones in place, with read and write activity lit across them">
+
 - **Makes every file and directory contiguous.** One run of clusters each, in ascending order.
 - **Draws free space toward the end of the volume**, so what remains is one large run rather than
   thousands of holes.
