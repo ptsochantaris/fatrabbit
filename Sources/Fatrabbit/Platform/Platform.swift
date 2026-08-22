@@ -3,7 +3,7 @@ import Foundation
 /// Everything fatrabbit needs from the operating system that the operating systems disagree about.
 ///
 /// The whole of the platform surface is the seven members declared below, each implemented once per
-/// platform in a file of its own. Nothing else in the codebase carries an `#if`: the FAT32 format
+/// platform in a file of its own. Nothing else in the codebase carries an `#if`: the FAT format
 /// layer, the planners, the defragmenter and the display are the same code everywhere, which is
 /// most of the reason this seam is worth having as a seam rather than as conditionals in place.
 ///
@@ -30,7 +30,7 @@ import Foundation
 /// That decision is deliberately not made here.
 ///
 /// **Whether anything underneath us is already caching.** `isUncached` decides whether
-/// `FAT32Volume` keeps its own metadata cache.
+/// `FATVolume` keeps its own metadata cache.
 ///
 /// **What to tell the user to type.** `detachCommand`, `unmountCommand` and the two example
 /// device names. Not cosmetic: before these were part of the seam, a Linux run refusing a mounted

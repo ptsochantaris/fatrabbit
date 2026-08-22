@@ -24,7 +24,7 @@ final class CopyBatch {
         var count: Int
         /// Why these bytes might be worth keeping once written — parked in spare space, or a
         /// directory that is about to be read again. The volume decides what to do with that.
-        let retention: FAT32Volume.Retention
+        let retention: FATVolume.Retention
         var data: Data?
     }
 
@@ -67,7 +67,7 @@ final class CopyBatch {
     /// is most likely to wonder whether anything is happening.
     var report: ((Activity) -> Void)?
 
-    private let volume: FAT32Volume
+    private let volume: FATVolume
     /// How much may be held before the batch has to go out. Bounded, because a run relocates
     /// gigabytes; large enough that a generation of small scattered objects is usually one pass.
     private let budget: Int
@@ -90,7 +90,7 @@ final class CopyBatch {
     private(set) var editsFolded = 0
     private(set) var editsWritten = 0
 
-    init(volume: FAT32Volume, budget: Int) {
+    init(volume: FATVolume, budget: Int) {
         self.volume = volume
         self.budget = budget
     }
@@ -98,7 +98,7 @@ final class CopyBatch {
     /// Queues a copy of `count` bytes. A span as large as the whole budget is already a sequential
     /// pass in its own right, so it goes straight out rather than displacing everything else.
     func copy(from source: UInt64, to destination: UInt64, count: Int,
-              retaining retention: FAT32Volume.Retention = .fileData) throws(FATError) {
+              retaining retention: FATVolume.Retention = .fileData) throws(FATError) {
         guard count < budget, volume.isAligned(source, count), volume.isAligned(destination, count) else {
             spansSentDirect += 1
             report?(Activity(writing: true, index: 0, total: 1, offset: destination,

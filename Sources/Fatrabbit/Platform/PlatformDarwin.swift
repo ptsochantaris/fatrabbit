@@ -4,7 +4,7 @@ import Foundation
 import IOKit
 
 // The Darwin half of the seam declared in Platform.swift. Every line here was in MountCheck.swift,
-// FAT32Volume.swift or main.swift before the split, and behaves as it did — the move is what makes
+// FATVolume.swift or main.swift before the split, and behaves as it did — the move is what makes
 // a second platform possible, not a change to this one.
 
 extension System {
@@ -50,7 +50,7 @@ extension System {
     /// work is reported in the wrong place at the wrong time, and the access pattern — the thing
     /// worth tuning — cannot be seen at all. It also caps every device request at 16 KB, so
     /// transfer shapes chosen here would never reach the medium. Going direct costs about five
-    /// seconds in nine minutes, given the metadata blocks held in `FAT32Volume` to stand in for the
+    /// seconds in nine minutes, given the metadata blocks held in `FATVolume` to stand in for the
     /// page cache.
     ///
     /// Image files have no raw counterpart and are passed through untouched.

@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Little-endian byte access
 
-/// A FAT32 volume is little-endian integers at fixed offsets, and this is the one place that knows
+/// A FAT volume is little-endian integers at fixed offsets, and this is the one place that knows
 /// how to reach them.
 ///
 /// Defined over `Span` rather than over `Array`, which is the whole of the difference. A span is a
@@ -19,7 +19,7 @@ import Foundation
 extension Span where Element == UInt8 {
     /// The little-endian `T` at `offset`.
     ///
-    /// Unaligned by construction. Nothing on a FAT32 volume promises a 32-bit field sits on a
+    /// Unaligned by construction. Nothing on a FAT volume promises a 32-bit field sits on a
     /// four-byte boundary, and some of them promise the opposite — a directory entry's first-cluster
     /// number is two 16-bit halves with the timestamps in between.
     func littleEndian<T: FixedWidthInteger & BitwiseCopyable>(_: T.Type, at offset: Int) -> T {
@@ -70,7 +70,7 @@ extension Array where Element == UInt8 {
 // MARK: - Errors
 
 enum FATError: Error, CustomStringConvertible {
-    case notFAT32(String)
+    case notFAT(String)
     case io(String)
     case corruption(String)
     case capacity(String)
@@ -81,7 +81,7 @@ enum FATError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .notFAT32(let m): return "Not a FAT32 volume: \(m)"
+        case .notFAT(let m): return "Not a FAT volume: \(m)"
         case .io(let m): return "I/O error: \(m)"
         case .corruption(let m): return "Filesystem corruption: \(m)"
         case .capacity(let m): return "Capacity error: \(m)"
@@ -97,7 +97,7 @@ enum FATError: Error, CustomStringConvertible {
 /// Exactly two things differ between the three, and this carries the first: how wide a table entry
 /// is, and therefore which values at the top of its range mean end-of-chain and bad. The second is
 /// whether the root directory is a relocatable chain or a fixed region outside the cluster space —
-/// `hasRelocatableRoot` here, and `FAT32Volume.RootLocation` in full.
+/// `hasRelocatableRoot` here, and `FATVolume.RootLocation` in full.
 ///
 /// Nothing above the format layer is touched by either. The planners, the copy batching and the
 /// staging work on cluster numbers held as `UInt32` and on `ClusterSet`, and a cluster number is a
@@ -280,7 +280,7 @@ struct BPB {
 
         guard bytesPerSector == 512 || bytesPerSector == 1024
             || bytesPerSector == 2048 || bytesPerSector == 4096 else {
-            throw FATError.notFAT32("unexpected bytes-per-sector \(bytesPerSector)")
+            throw FATError.notFAT("unexpected bytes-per-sector \(bytesPerSector)")
         }
 
         let fatSize16 = Int(boot.littleEndian(UInt16.self, at: 22))
@@ -289,7 +289,7 @@ struct BPB {
         totalSectors = totSec16 != 0 ? UInt32(totSec16) : boot.littleEndian(UInt32.self, at: 32)
 
         guard sectorsPerCluster > 0, numFATs > 0, fatSize > 0, totalSectors > 0 else {
-            throw FATError.notFAT32("invalid BPB geometry")
+            throw FATError.notFAT("invalid BPB geometry")
         }
 
         // Rounded up: a root of 512 entries is 16 KiB, which need not be a whole number of sectors
@@ -299,7 +299,7 @@ struct BPB {
         rootDirSectors = ((rootEntCnt * DirectoryEntry.size) + bytesPerSector - 1) / bytesPerSector
 
         let firstDataSector = reservedSectorCount + numFATs * fatSize + rootDirSectors
-        guard Int(totalSectors) > firstDataSector else { throw FATError.notFAT32("no data region") }
+        guard Int(totalSectors) > firstDataSector else { throw FATError.notFAT("no data region") }
         countOfClusters = UInt32((Int(totalSectors) - firstDataSector) / sectorsPerCluster)
 
         // The definition, and the only one there is: which variant a volume is follows from how many
@@ -312,7 +312,7 @@ struct BPB {
         default: .fat32
         }
 
-        guard countOfClusters >= 1 else { throw FATError.notFAT32("no clusters") }
+        guard countOfClusters >= 1 else { throw FATError.notFAT("no clusters") }
 
         if flavour == .fat32 {
             extFlags = boot.littleEndian(UInt16.self, at: 40)
@@ -323,11 +323,11 @@ struct BPB {
             // this can classify — it is a damaged or hand-built boot record, and guessing which half
             // to believe would mean reading the volume through the wrong geometry.
             guard rootEntCnt == 0, fatSize16 == 0 else {
-                throw FATError.notFAT32("\(countOfClusters) clusters is FAT32, but the boot record "
+                throw FATError.notFAT("\(countOfClusters) clusters is FAT32, but the boot record "
                     + "also claims a \(rootEntCnt)-entry fixed root and a 16-bit FAT size")
             }
             guard rootCluster >= 2, rootCluster <= countOfClusters + 1 else {
-                throw FATError.notFAT32("root cluster \(rootCluster) is outside the data region")
+                throw FATError.notFAT("root cluster \(rootCluster) is outside the data region")
             }
         } else {
             extFlags = 0
@@ -337,7 +337,7 @@ struct BPB {
             // The fixed root is the only way in to a FAT12/16 volume, so a volume claiming none of
             // it has nothing this tool can walk.
             guard rootEntCnt > 0 else {
-                throw FATError.notFAT32("\(flavour.name) volume with no root directory entries")
+                throw FATError.notFAT("\(flavour.name) volume with no root directory entries")
             }
         }
     }
@@ -470,7 +470,7 @@ enum DirectoryEntry {
 /// time, and it cannot outlive the volume holding it. A double close is not a harmless mistake on a
 /// tool that writes to raw devices — the number could have been reused by then.
 ///
-/// The `deinit` also covers the path this exists for. `FAT32Volume.init` has half a dozen ways to
+/// The `deinit` also covers the path this exists for. `FATVolume.init` has half a dozen ways to
 /// throw after the volume is open, and a class deinitialiser does not run for an object whose
 /// initialisation never completed, so a `deinit` on the volume itself would leak the descriptor on
 /// every one of them. A stored noncopyable property is destroyed on that path regardless. Verified
@@ -485,7 +485,7 @@ private struct OpenDescriptor: ~Copyable {
 /// A read-write view over a FAT12, FAT16 or FAT32 partition (device node or image file). The volume
 /// is opened for updating so the defragmenter can relocate clusters in place; callers are
 /// responsible for ensuring the volume is unmounted before mutating it.
-final class FAT32Volume {
+final class FATVolume {
     /// Where the root directory's entries live.
     ///
     /// On FAT32 the root is a file like any other directory, so this is a first cluster and the
@@ -554,17 +554,17 @@ final class FAT32Volume {
         // reports all of them as nil.
         let opened = open(path, dryRun ? O_RDONLY : O_RDWR)
         guard opened >= 0 else {
-            throw FATError.io(FAT32Volume.openFailure(path: path, code: errno, dryRun: dryRun))
+            throw FATError.io(FATVolume.openFailure(path: path, code: errno, dryRun: dryRun))
         }
         self.file = OpenDescriptor(opened)
         self.caches = System.isUncached(opened)
 
-        let blockSize = FAT32Volume.probeBlockSize(opened)
+        let blockSize = FATVolume.probeBlockSize(opened)
         self.blockSize = blockSize
 
         // Boot sector lives at offset 0. Read a generous 512 bytes first to learn the
         // sector size, which is enough for every BPB field we touch.
-        let boot = try FAT32Volume.read(opened, blockSize: blockSize, at: 0, count: 512)
+        let boot = try FATVolume.read(opened, blockSize: blockSize, at: 0, count: 512)
         // Geometry, and which of the three this is, are settled together: the classification follows
         // from the cluster count and the cluster count follows from the geometry, so neither can be
         // had without the other. Everything that used to be checked out here is checked in there.
@@ -610,11 +610,11 @@ final class FAT32Volume {
         // not a trap but a wrong answer.
         let bytesNeeded = flavour.byteRange(ofCluster: UInt32(entriesNeeded - 1)).upperBound
         guard bytesNeeded <= fatByteCount else {
-            throw FATError.notFAT32("\(flavour.name) table of \(fatByteCount) bytes is too small "
+            throw FATError.notFAT("\(flavour.name) table of \(fatByteCount) bytes is too small "
                 + "for the \(entriesNeeded) entries \(bpb.countOfClusters) clusters need")
         }
 
-        let fatRaw = try FAT32Volume.read(opened,
+        let fatRaw = try FATVolume.read(opened,
                                           blockSize: blockSize,
                                           at: fatStartOffset + UInt64(activeFatIndex * fatByteCount),
                                           count: fatByteCount)
@@ -964,7 +964,7 @@ final class FAT32Volume {
             return hit.data
         }
         if traffic == .metadata { cacheReport.metadataMisses += 1 } else { cacheReport.bulkMisses += 1 }
-        let data = try FAT32Volume.rawRead(descriptor, at: offset, count: count)
+        let data = try FATVolume.rawRead(descriptor, at: offset, count: count)
         if traffic.isRetained { admit(data, at: offset, staged: traffic == .staged) }
         return data
     }
@@ -976,7 +976,7 @@ final class FAT32Volume {
     /// place would serve a later reader bytes the medium no longer holds.
     private func deviceWrite(_ data: Data, at offset: UInt64, _ traffic: Traffic) throws(FATError) {
         guard !dryRun else { return }
-        try FAT32Volume.rawWrite(descriptor, data, at: offset)
+        try FATVolume.rawWrite(descriptor, data, at: offset)
         drop(from: offset, count: data.count)
         if traffic.isRetained { admit(data, at: offset, staged: traffic == .staged) }
     }
@@ -1060,7 +1060,7 @@ final class FAT32Volume {
 
         var done = 0
         while done < count {
-            let chunk = min(FAT32Volume.maxTransfer, count - done)
+            let chunk = min(FATVolume.maxTransfer, count - done)
             // The read still happens on a dry run — only the write is dropped. It costs no more than
             // skipping the pair would save, and it proves every source cluster the plan wants to move
             // is actually readable.

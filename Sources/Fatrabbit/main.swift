@@ -183,7 +183,7 @@ func defragment(_ options: Options, report: Reporter) throws(FATError) -> Bool {
                                         fast: options.fast,
                                         deMac: options.deMac)))
 
-    let volume = try FAT32Volume(path: source, dryRun: options.dryRun)
+    let volume = try FATVolume(path: source, dryRun: options.dryRun)
     report.post(.opened(RunEvent.Geometry(label: volume.label,
                                           flavour: volume.flavour.name,
                                           clusterSize: volume.clusterSize,

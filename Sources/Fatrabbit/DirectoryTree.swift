@@ -75,14 +75,15 @@ final class FSObject {
     }
 }
 
-/// Walks the FAT32 directory tree, following cluster chains, and returns the root object with
-/// the tree of non-empty files and directories beneath it.
+/// Walks the directory tree — following cluster chains, and starting from the fixed root region
+/// where the volume has one — and returns the root object with the tree of non-empty files and
+/// directories beneath it.
 ///
 /// With `deMac` enabled, macOS metadata is pruned as the tree is walked: the objects never
 /// reach the planner, and their directory entries and clusters are recorded so the caller can
 /// erase and release them.
 final class DirectoryWalker {
-    let volume: FAT32Volume
+    let volume: FATVolume
     let deMac: Bool
     /// Optional, only so the walk can say how far it has got. On a card the scan is minutes of
     /// silence otherwise, since every directory costs a real read.
@@ -99,7 +100,7 @@ final class DirectoryWalker {
     private var filesSeen = 0
     private var bytesRead: UInt64 = 0
 
-    init(volume: FAT32Volume, deMac: Bool = false, report: Reporter? = nil) {
+    init(volume: FATVolume, deMac: Bool = false, report: Reporter? = nil) {
         self.volume = volume
         self.deMac = deMac
         self.report = report

@@ -28,7 +28,7 @@ import Foundation
 /// Nothing here knows anything about display. Every figure it keeps and every operation it performs
 /// goes out as an event, unconditionally, and what any of that is worth saying is decided elsewhere.
 final class SafeDefragmenter {
-    private let volume: FAT32Volume
+    private let volume: FATVolume
     private let plan: DefragPlan
     private let report: Reporter
     private let cleanup: MacCleanup?
@@ -101,7 +101,7 @@ final class SafeDefragmenter {
     /// the exit status; everything written by then is committed either way.
     private(set) var wasInterrupted = false
 
-    init(volume: FAT32Volume, plan: DefragPlan, report: Reporter, cleanup: MacCleanup?,
+    init(volume: FATVolume, plan: DefragPlan, report: Reporter, cleanup: MacCleanup?,
          fast: Bool = false) {
         self.volume = volume
         self.plan = plan
@@ -451,7 +451,7 @@ final class SafeDefragmenter {
         // Both of the things the volume cannot work out for itself. A parked copy exists only to be read
         // back; a directory's clusters are read again the moment anything is pointed at them — every
         // child's `..`, the dot-entry check at the end, and every pointer flip that lands in them.
-        let retention: FAT32Volume.Retention = temporary ? .staged
+        let retention: FATVolume.Retention = temporary ? .staged
             : (object.isDirectory ? .directory : .fileData)
         var i = 0
         while i < old.count {

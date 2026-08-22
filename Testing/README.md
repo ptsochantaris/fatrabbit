@@ -984,7 +984,7 @@ are where that shows, which makes the watched display a diagnostic tool and not 
 `FileHandle.read(upToCount:)` reads like modern Swift and is not. The backtrace that found the memory
 problem below says what it really is:
 
-    FAT32Volume.rawRead | NSFileHandle.read(upToCount:)
+    FATVolume.rawRead | NSFileHandle.read(upToCount:)
       | -[NSConcreteFileHandle readDataUpToLength:error:]
       | -[NSConcreteFileHandle readDataOfLength:] | _malloc
 
