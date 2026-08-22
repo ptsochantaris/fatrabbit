@@ -36,43 +36,6 @@ Written in Swift 6, runs on macOS and Linux, no dependencies.
   `.Spotlight-V100`, `.fseventsd`, `.Trashes`, and friends. Useful when the card is going back into
   a device that will display those as if they were real files.
 
-## Safety
-
-The volume is modified in place, but never destructively. Every relocation is a copy into clusters
-the FAT says are *free*, followed by a commit — nothing referenced is ever overwritten:
-
-1. copy the data into free clusters,
-2. allocate the copy as a chain in the FAT,
-3. flip every pointer to the object over to the copy,
-4. release the original chain.
-
-Steps 3 and 4 sit behind durability barriers: allocations reach the medium before anything names
-them, and the pointer flips reach the medium before the clusters they abandoned can be handed out
-again. That ordering is the whole safety argument, and it means an interruption — Ctrl-C, a yanked
-cable, a power cut — costs at most some clusters that are allocated but referenced by nothing. The
-next run reclaims them as orphans.
-
-Ctrl-C once stops after the batch in flight, leaving a consistent, partly defragmented volume that a
-later run carries on from. Ctrl-C twice stops immediately; the design survives that too, since it is
-precisely what a power cut does.
-
-That argument is about the *order* writes reach the medium, not about how a table entry is encoded,
-so it holds identically on all three variants. One thing does differ, and it is worth knowing:
-
-- **On FAT12, an interrupted run is flagged in the boot record and nowhere else.** The other two
-  variants also clear a clean-shutdown bit in FAT entry 1, which is the flag most tools check.
-  Twelve bits leave no room for one, so FAT12 has never had it. The volume is still consistent — the
-  copy-then-repoint design is what guarantees that — but your operating system is less likely to
-  offer to check it for you.
-
-Two things worth knowing before you point it at something you care about:
-
-- **A mounted volume is refused outright**, dry run or not. This is the one hazard copy-then-repoint
-  cannot cover: the kernel holds its own cached copy of the FAT and directory blocks and will write
-  them back over ours whenever it pleases. Unmount the volume but leave the device attached.
-- **Back up anything irreplaceable.** The design is careful and the failure mode is benign, but this
-  is a tool that rewrites filesystem metadata on removable media. Use `--dry-run` first.
-
 ## Requirements
 
 | | |
@@ -230,6 +193,43 @@ dumb.
 | 0 | Completed |
 | 1 | Error — bad arguments, not a FAT volume, mounted volume, I/O failure |
 | 130 | Stopped by Ctrl-C; the volume is consistent and a later run resumes |
+
+## Safety
+
+The volume is modified in place, but never destructively. Every relocation is a copy into clusters
+the FAT says are *free*, followed by a commit — nothing referenced is ever overwritten:
+
+1. copy the data into free clusters,
+2. allocate the copy as a chain in the FAT,
+3. flip every pointer to the object over to the copy,
+4. release the original chain.
+
+Steps 3 and 4 sit behind durability barriers: allocations reach the medium before anything names
+them, and the pointer flips reach the medium before the clusters they abandoned can be handed out
+again. That ordering is the whole safety argument, and it means an interruption — Ctrl-C, a yanked
+cable, a power cut — costs at most some clusters that are allocated but referenced by nothing. The
+next run reclaims them as orphans.
+
+Ctrl-C once stops after the batch in flight, leaving a consistent, partly defragmented volume that a
+later run carries on from. Ctrl-C twice stops immediately; the design survives that too, since it is
+precisely what a power cut does.
+
+That argument is about the *order* writes reach the medium, not about how a table entry is encoded,
+so it holds identically on all three variants. One thing does differ, and it is worth knowing:
+
+- **On FAT12, an interrupted run is flagged in the boot record and nowhere else.** The other two
+  variants also clear a clean-shutdown bit in FAT entry 1, which is the flag most tools check.
+  Twelve bits leave no room for one, so FAT12 has never had it. The volume is still consistent — the
+  copy-then-repoint design is what guarantees that — but your operating system is less likely to
+  offer to check it for you.
+
+Two things worth knowing before you point it at something you care about:
+
+- **A mounted volume is refused outright**, dry run or not. This is the one hazard copy-then-repoint
+  cannot cover: the kernel holds its own cached copy of the FAT and directory blocks and will write
+  them back over ours whenever it pleases. Unmount the volume but leave the device attached.
+- **Back up anything irreplaceable.** The design is careful and the failure mode is benign, but this
+  is a tool that rewrites filesystem metadata on removable media. Use `--dry-run` first.
 
 ## Measurement harness
 
