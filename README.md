@@ -58,8 +58,12 @@ The same two commands on macOS and on Linux:
 git clone https://github.com/ptsochantaris/fatrabbit
 cd fatrabbit
 make release                 # -> .build/release/fatrabbit
-sudo make install            # -> /usr/local/bin/fatrabbit
+make install                 # -> /usr/local/bin/fatrabbit
 ```
+
+Run `make install` as yourself, not under `sudo`: it builds as you and escalates only the copy, and
+only if the destination needs it. `make install PREFIX=~/.local` lands somewhere you already own and
+asks for nothing.
 
 `make release` is the build to ship: `-O` and whole-module from the release configuration,
 `-Ounchecked` from the manifest, and full LTO. That last one is the entire reason this project has a

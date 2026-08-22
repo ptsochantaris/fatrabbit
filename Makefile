@@ -40,7 +40,10 @@
 
 BIN := .build/release/fatrabbit
 
-.PHONY: all release debug run clean install linux linux-sync linux-shell
+PREFIX ?= /usr/local
+BINDIR := $(DESTDIR)$(PREFIX)/bin
+
+.PHONY: all release debug run clean install uninstall linux linux-sync linux-shell
 
 all: release
 
@@ -56,8 +59,23 @@ debug:
 run: release
 	@echo $(abspath $(BIN))
 
+# Only the copy escalates, never the build. `sudo make install` would rebuild the whole package as
+# root and leave a .build tree your own account can no longer write to, so the escalation is here
+# rather than on the command line: build as you, then sudo the one command that needs it, and only
+# when it needs it. That last part is the whole bug — /usr/local/bin is group-writable by admin on
+# macOS and root-only on Linux, so the plain `install` succeeded on one and not the other.
+# Override PREFIX or DESTDIR to land somewhere you already own and no sudo happens at all.
 install: release
-	install -m 0755 $(BIN) /usr/local/bin/fatrabbit
+	@if [ -w "$(BINDIR)" ]; then \
+	    install -m 0755 $(BIN) "$(BINDIR)/fatrabbit"; \
+	else \
+	    echo "$(BINDIR) is not writable, asking for sudo"; \
+	    sudo install -d -m 0755 "$(BINDIR)" && sudo install -m 0755 $(BIN) "$(BINDIR)/fatrabbit"; \
+	fi
+	@echo "installed $(BINDIR)/fatrabbit"
+
+uninstall:
+	@if [ -w "$(BINDIR)" ]; then rm -f "$(BINDIR)/fatrabbit"; else sudo rm -f "$(BINDIR)/fatrabbit"; fi
 
 # The Linux side. A container rather than a cross-compilation SDK, because cross-compiling proves
 # only that it builds — and the errors worth catching here were not build errors. The image is
