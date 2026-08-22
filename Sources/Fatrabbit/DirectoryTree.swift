@@ -36,19 +36,33 @@ final class FSObject {
     /// own first cluster and `..` names its parent's, so this is what says whether either entry
     /// could possibly have needed writing.
     let originalStart: UInt32
+    /// Absolute device offset of this directory's entries, for the one directory that has no chain:
+    /// a FAT12/16 root, which lives in a fixed region outside the cluster space. Nil for everything
+    /// else, which is addressed through `chain` as it always was.
+    ///
+    /// Set rather than derived, because deriving it would mean handing every `FSObject` a reference
+    /// to the volume for the sake of one object per run. What it buys is that a directory-relative
+    /// entry offset can be resolved for *any* directory without the caller first having to ask which
+    /// kind it is dealing with — see `SafeDefragmenter.pointerField`.
+    let fixedAt: UInt64?
 
     init(name: String, isDirectory: Bool, isRoot: Bool = false, entryOffset: Int = 0,
-         parent: FSObject? = nil, chain: ClusterSet) {
+         parent: FSObject? = nil, chain: ClusterSet, fixedAt: UInt64? = nil) {
         self.name = name
         self.isDirectory = isDirectory
         self.isRoot = isRoot
         self.entryOffset = entryOffset
         self.parent = parent
         self.chain = chain
+        self.fixedAt = fixedAt
         self.originalStart = chain.first ?? 0
     }
 
-    var start: UInt32 { chain[0] }
+    /// This object's first cluster, and 0 for a directory that occupies none — which is only ever a
+    /// FAT12/16 root. Not `chain[0]`, which traps on an empty chain: the fixed root is excluded from
+    /// every schedule and every layout decision, so nothing should be asking, and a nil-returning
+    /// answer beats a crash if something does.
+    var start: UInt32 { chain.first ?? 0 }
 
     /// Number of separate runs the chain occupies; 1 means contiguous.
     var extentCount: Int { chain.extentCount }
@@ -74,12 +88,12 @@ final class DirectoryWalker {
     /// silence otherwise, since every directory costs a real read.
     private let report: Reporter?
 
-    private var removals: [UInt32: [Int]] = [:]
+    private var removals: [UInt64: [Int]] = [:]
     private var removedNames: [String] = []
     private var removedFiles = 0
     private var removedDirectories = 0
     private var removedClusters: [UInt32] = []
-    private var hiddenDots: [(cluster: UInt32, offset: Int)] = []
+    private var hiddenDots: [(at: UInt64, offset: Int)] = []
 
     private var directoriesSeen = 0
     private var filesSeen = 0
@@ -93,8 +107,16 @@ final class DirectoryWalker {
 
     func walk() throws(FATError) -> (root: FSObject, cleanup: MacCleanup) {
         let started = ContinuousClock.now
-        let rootChain = try volume.chain(startingAt: volume.bpb.rootCluster)
-        let root = FSObject(name: "", isDirectory: true, isRoot: true, chain: .list(rootChain))
+        // The root is a chain like any other directory's on FAT32, and a fixed region on FAT12/16.
+        // The region case gets an empty chain, which is the truth: it occupies no clusters, so there
+        // is nothing about it for a relocation schedule to hold an opinion about.
+        let root: FSObject = switch volume.rootLocation {
+        case .chain(let first):
+            FSObject(name: "", isDirectory: true, isRoot: true,
+                     chain: .list(try volume.chain(startingAt: first)))
+        case .region(let offset, _):
+            FSObject(name: "", isDirectory: true, isRoot: true, chain: .list([]), fixedAt: offset)
+        }
         try populate(root)
         // A last set of totals, then the phase closing with what it cost. What either is worth saying
         // about is decided on the far side of the stream.
@@ -125,8 +147,7 @@ final class DirectoryWalker {
         // written at this stage, so unwinding out of the scan leaves the volume untouched.
         if Interruption.requested { throw FATError.interrupted }
 
-        let chain = directory.chain
-        let bytes = try directoryBytes(of: chain)
+        let bytes = try directoryBytes(of: directory)
         // Reported once per directory, which is exactly the pace of the reads above: the rest of
         // the parse is in memory, so this ticks along with the work actually being waited on. The
         // buffer's length is what was fetched, since a directory is read up to its end and no
@@ -187,13 +208,13 @@ final class DirectoryWalker {
             if shortName == ".." {
                 directory.dotDotOffset = entryOffset
                 directory.dotDotStart = entryStart
-                recordHiddenDot(attr, chain: chain, at: entryOffset)
+                recordHiddenDot(attr, in: directory, at: entryOffset)
                 continue
             }
             if shortName == "." {
                 directory.dotOffset = entryOffset
                 directory.dotStart = entryStart
-                recordHiddenDot(attr, chain: chain, at: entryOffset)
+                recordHiddenDot(attr, in: directory, at: entryOffset)
                 continue
             }
 
@@ -204,7 +225,7 @@ final class DirectoryWalker {
             // legal 8.3 names, so on disk they carry a mangled short name plus LFN entries.
             let displayName = longName ?? shortName
             if deMac, MacCruft.matches(displayName, isRoot: directory.isRoot) {
-                recordRemoval(chain: chain, from: runStart, through: entryOffset)
+                recordRemoval(in: directory, from: runStart, through: entryOffset)
                 removedNames.append(displayName)
                 if isDir { removedDirectories += 1 } else { removedFiles += 1 }
                 if start >= 2 {
@@ -241,25 +262,39 @@ final class DirectoryWalker {
     /// that applies it reads nothing, and on the usual volume — where none are hidden — there is
     /// nothing for it to do at all. Only gathered under `--deMac`, which is the only thing that
     /// acts on it.
-    private func recordHiddenDot(_ attr: UInt8, chain: ClusterSet, at offset: Int) {
+    private func recordHiddenDot(_ attr: UInt8, in directory: FSObject, at offset: Int) {
         guard deMac, (attr & 0x02) != 0 else { return }
-        let index = offset / volume.clusterSize
-        guard index < chain.count else { return }
-        hiddenDots.append((cluster: chain[index], offset: offset % volume.clusterSize))
+        guard let place = run(in: directory, at: offset) else { return }
+        hiddenDots.append(place)
     }
 
     /// Marks every 32-byte slot from `from` through `through` for deletion, translating
-    /// directory-relative offsets into the clusters that hold them. Entries never straddle a
-    /// cluster boundary, since cluster sizes are multiples of 32.
-    private func recordRemoval(chain: ClusterSet, from: Int, through: Int) {
-        let clusterSize = volume.clusterSize
+    /// directory-relative offsets into the runs of device that hold them. Entries never straddle a
+    /// run boundary, since cluster sizes and the fixed root's length are both multiples of 32.
+    private func recordRemoval(in directory: FSObject, from: Int, through: Int) {
         var offset = from
         while offset <= through {
-            let index = offset / clusterSize
-            guard index < chain.count else { break }
-            removals[chain[index], default: []].append(offset % clusterSize)
-            offset += 32
+            guard let place = run(in: directory, at: offset) else { break }
+            removals[place.at, default: []].append(place.offset)
+            offset += DirectoryEntry.size
         }
+    }
+
+    /// Turns a directory-relative entry offset into the device offset of the run of directory data
+    /// holding it, plus the offset within that run.
+    ///
+    /// Two kinds of run, which is the whole reason this exists: a cluster, for every directory on a
+    /// FAT32 volume and every non-root directory on the other two — and, for a FAT12/16 root, the
+    /// single fixed region it occupies, which has no clusters to index into. Nil where the offset
+    /// falls past the end of the directory's data.
+    private func run(in directory: FSObject, at offset: Int) -> (at: UInt64, offset: Int)? {
+        if let fixedAt = directory.fixedAt {
+            guard case .region(_, let size) = volume.rootLocation, offset < size else { return nil }
+            return (fixedAt, offset)
+        }
+        let index = offset / volume.clusterSize
+        guard index < directory.chain.count else { return nil }
+        return (volume.offset(ofCluster: directory.chain[index]), offset % volume.clusterSize)
     }
 
     /// How much of a directory to fetch before looking for its end.
@@ -284,6 +319,32 @@ final class DirectoryWalker {
     /// Worth little on the spinning drive, where a read is a 9.42 ms rotation and 16 KiB of payload
     /// is 0.4 ms of it — but the card is where this phase is 41,651 reads.
     private static let entryProbe = 4096
+
+    /// A directory's entries, wherever it happens to keep them.
+    ///
+    /// The one directory that does not keep them in a chain is a FAT12/16 root, so this asks which
+    /// kind it is holding and the two paths below answer for their own shape. Callers walking the
+    /// tree come here rather than to either of them, which is what keeps "is this the odd root?" out
+    /// of the parse entirely.
+    private func directoryBytes(of directory: FSObject) throws(FATError) -> [UInt8] {
+        guard let fixedAt = directory.fixedAt else { return try directoryBytes(of: directory.chain) }
+        guard case .region(_, let size) = volume.rootLocation else { return [] }
+        return try directoryBytes(at: fixedAt, length: size)
+    }
+
+    /// The same early stop as below, over a flat run of device rather than over a chain.
+    ///
+    /// Worth having rather than reading the region whole, for the reason the probe exists at all: a
+    /// root formatted for 512 entries is 16 KiB and a card's root holds a couple of dozen names, so
+    /// the marker is almost always inside the first probe. The region is contiguous by definition,
+    /// which makes this the simpler of the two — there is no chain to follow when the probe falls
+    /// short, just the remainder.
+    private func directoryBytes(at offset: UInt64, length: Int) throws(FATError) -> [UInt8] {
+        let probe = min(Self.entryProbe, length)
+        let bytes = try volume.readBytes(at: offset, count: probe)
+        if probe == length || Self.endOfDirectory(in: bytes) { return bytes }
+        return bytes + (try volume.readBytes(at: offset + UInt64(probe), count: length - probe))
+    }
 
     /// Every cluster of a directory, concatenated, which is the shape its entries are parsed in: an
     /// entry never straddles a cluster boundary, but a long name's run of them can.

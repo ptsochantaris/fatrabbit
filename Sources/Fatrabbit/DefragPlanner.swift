@@ -19,13 +19,21 @@ struct DefragPlan {
 }
 
 enum DefragPlanner {
-    /// Orders the tree for a contiguous, compacted layout: the root directory first, then each
-    /// root child's whole subtree, with `--first` entries leading and `--last` entries trailing.
+    /// Orders the tree for a contiguous, compacted layout: the root directory first where it is a
+    /// relocatable one, then each root child's whole subtree, with `--first` entries leading and
+    /// `--last` entries trailing.
+    ///
+    /// - Parameter movableRoot: whether the root directory is an object at all as far as a layout is
+    ///   concerned. It is on FAT32, where the root is a chain like any other and belongs on the
+    ///   lowest cluster. On FAT12/16 it is a fixed region outside the cluster space, so it is left
+    ///   out of the order entirely rather than being carried through it as a special case — which
+    ///   also hands the first cluster to the first real child, exactly as it should.
     static func plan(root: FSObject,
                      first: [String],
                      last: [String],
                      capacity: UInt32,
-                     fast: Bool = false) throws(FATError) -> DefragPlan {
+                     fast: Bool = false,
+                     movableRoot: Bool = true) throws(FATError) -> DefragPlan {
         let (firstObjects, middleObjects, lastObjects, matchedFirst, matchedLast, unmatched) =
             orderRootChildren(root.children, first: first, last: last)
 
@@ -45,8 +53,8 @@ enum DefragPlanner {
             trailing.sort { $0.start < $1.start }
         }
 
-        // The root directory always leads, so that it lands on the first usable cluster.
-        let flat: [FSObject] = [root] + leading + middle + trailing
+        // The root directory leads where it can move, so that it lands on the first usable cluster.
+        let flat: [FSObject] = (movableRoot ? [root] : []) + leading + middle + trailing
 
         var used: UInt32 = 0
         var fileCount = 0

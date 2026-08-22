@@ -1,13 +1,18 @@
 # fatrabbit
 
-Defragments a FAT32 volume in place, so that every file and directory ends up occupying a single
-contiguous run — then rewrites the FATs and boot record to match.
+Defragments a FAT volume in place — FAT12, FAT16 or FAT32 — so that every file and directory ends up
+occupying a single contiguous run, then rewrites the FATs and boot record to match.
 
 It is aimed at removable media and at the machines that read it: cards in cameras, samplers, synths,
-handhelds, car stereos, and anything else whose firmware reads a FAT32 volume with a simple loop and
+handhelds, car stereos, and anything else whose firmware reads a FAT volume with a simple loop and
 no readahead worth the name. On hardware like that, layout *is* performance. A file scattered across
 forty extents costs forty seeks on a spinning drive and forty command round-trips on a card, and no
 amount of host-side cleverness helps a device that has none.
+
+That audience is why FAT16 is here and not only FAT32. Samplers, car stereos, flash carts, industrial
+and medical instruments and anything on a card under 2 GB are very largely FAT16, and they are
+precisely the primitive readers this tool exists for. FAT12 comes along because it is nearly the same
+code, not because a volume of under 4,085 clusters has much to gain.
 
 Written in Swift 6, runs on macOS and Linux, no dependencies.
 
@@ -18,6 +23,10 @@ Written in Swift 6, runs on macOS and Linux, no dependencies.
   thousands of holes.
 - **Places directories with their entire subtree**, so a folder and its contents are read as one
   sweep instead of a walk back and forth across the volume.
+- **Leaves a FAT12/16 root directory alone**, because on those two variants it is a fixed region
+  between the tables and the data area rather than a cluster chain. Nothing points at it and nothing
+  can move it, so the first data cluster goes to the first real entry instead. On FAT32 the root
+  *is* a chain, and it is placed first.
 - **Lets you choose what goes where.** `--first` and `--last` pin named root-level entries to the
   front or the back, in the order given — useful when a device reads a particular file at startup,
   or plays a card in directory order.
@@ -47,6 +56,15 @@ Ctrl-C once stops after the batch in flight, leaving a consistent, partly defrag
 later run carries on from. Ctrl-C twice stops immediately; the design survives that too, since it is
 precisely what a power cut does.
 
+That argument is about the *order* writes reach the medium, not about how a table entry is encoded,
+so it holds identically on all three variants. One thing does differ, and it is worth knowing:
+
+- **On FAT12, an interrupted run is flagged in the boot record and nowhere else.** The other two
+  variants also clear a clean-shutdown bit in FAT entry 1, which is the flag most tools check.
+  Twelve bits leave no room for one, so FAT12 has never had it. The volume is still consistent — the
+  copy-then-repoint design is what guarantees that — but your operating system is less likely to
+  offer to check it for you.
+
 Two things worth knowing before you point it at something you care about:
 
 - **A mounted volume is refused outright**, dry run or not. This is the one hazard copy-then-repoint
@@ -62,7 +80,7 @@ Two things worth knowing before you point it at something you care about:
 | Swift | 6.2 or later |
 | macOS | 26.3 or later |
 | Linux | any distribution with a Swift 6.2+ toolchain |
-| Filesystem | FAT32 only — not FAT16, FAT12, or exFAT |
+| Filesystem | FAT12, FAT16 or FAT32 — not exFAT, which is a different filesystem |
 | Privileges | root for a device node; none at all for an image file |
 
 ## Building
@@ -108,7 +126,7 @@ exercising the mount check for real requires a loop device.
 
 ### What differs between the platforms
 
-Only one file each. The FAT32 format layer, the planners, the defragmenter and the display are the
+Only one file each. The FAT format layer, the planners, the defragmenter and the display are the
 same code everywhere; the platform seam is seven members in
 [`Platform.swift`](Sources/Fatrabbit/Platform/Platform.swift), implemented once per OS. The
 differences that are real rather than cosmetic:
@@ -127,7 +145,8 @@ differences that are real rather than cosmetic:
 fatrabbit <volume> [options]
 ```
 
-`<volume>` is an **unmounted** FAT32 device node or an image file.
+`<volume>` is an **unmounted** FAT device node or an image file. Which variant it is follows from the
+volume's own cluster count and is worked out on opening — there is no flag for it.
 
 ### macOS
 
@@ -209,7 +228,7 @@ dumb.
 | Code | Meaning |
 | --- | --- |
 | 0 | Completed |
-| 1 | Error — bad arguments, not a FAT32 volume, mounted volume, I/O failure |
+| 1 | Error — bad arguments, not a FAT volume, mounted volume, I/O failure |
 | 130 | Stopped by Ctrl-C; the volume is consistent and a later run resumes |
 
 ## Measurement harness

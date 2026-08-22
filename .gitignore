@@ -60,3 +60,6 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Python bytecode from the measurement harness, which now imports across its own scripts
+__pycache__/

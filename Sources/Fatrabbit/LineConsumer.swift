@@ -216,9 +216,16 @@ final class LineConsumer: EventConsumer {
 
         case .opened(let geometry):
             self.geometry = geometry
-            line("FAT32: \(geometry.bytesPerSector)-byte sectors, "
+            line("\(geometry.flavour): \(geometry.bytesPerSector)-byte sectors, "
                 + "\(geometry.sectorsPerCluster) sectors/cluster (\(geometry.clusterSize) bytes), "
                 + "\(geometry.clusterCount) clusters.")
+            // Said only where there is one, which is the two variants that keep the root outside the
+            // cluster space. It explains something a run on those volumes would otherwise look odd
+            // for: the root is not among the objects placed, and it never moves.
+            if let entries = geometry.fixedRootEntries {
+                line("Root directory is a fixed \(entries)-entry region outside the data area, "
+                    + "so it is left where it is.")
+            }
 
         case .labelled:
             // Only something with a title to put it in has any use for this.

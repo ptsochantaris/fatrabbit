@@ -52,13 +52,18 @@ enum ClusterState: UInt8, CaseIterable {
     /// Everything in use starts as plain file data, because before the scan there is nothing else it
     /// could honestly be said to be. What each cluster actually holds, and which of it the run intends
     /// to shift, arrive later as the tree is walked and the schedule is settled.
-    static func layout(of fat: [UInt32], clusterCount: UInt32) -> [ClusterState] {
+    ///
+    /// - Parameter badMarker: the entry value meaning "the medium failed here", which differs by
+    ///   variant. Passed in rather than reached for, because this is a static with no volume in
+    ///   scope and the alternative is a global that would be right for one variant out of three.
+    static func layout(of fat: [UInt32], clusterCount: UInt32,
+                       badMarker: UInt32) -> [ClusterState] {
         var states = [ClusterState](repeating: .free, count: Int(clusterCount))
         for index in 0 ..< states.count {
             let cluster = index + 2
             guard cluster < fat.count else { break }
             let entry = fat[cluster]
-            states[index] = entry == 0 ? .free : (entry == FAT.badCluster ? .bad : .file)
+            states[index] = entry == 0 ? .free : (entry == badMarker ? .bad : .file)
         }
         return states
     }

@@ -123,10 +123,19 @@ enum RunEvent: Sendable {
     struct Geometry: Sendable {
         /// From the boot sector. `labelled` supersedes it if the root directory carries a better one.
         let label: String
+        /// Which of the three variants, as text, because nothing downstream branches on it — the
+        /// engine has already decided everything that follows from the answer, and a consumer only
+        /// wants to say what kind of volume this was.
+        let flavour: String
         let clusterSize: Int
         let clusterCount: UInt32
         let bytesPerSector: Int
         let sectorsPerCluster: Int
+        /// How many entries the fixed root holds, on the two variants that have one, and nil on
+        /// FAT32 where the root is a chain that can grow. Worth reporting because it is a ceiling a
+        /// FAT32 user never meets: a root formatted for 512 names cannot hold a 513th, whatever
+        /// space is free.
+        let fixedRootEntries: Int?
 
         var byteCount: UInt64 { UInt64(clusterCount) * UInt64(clusterSize) }
     }

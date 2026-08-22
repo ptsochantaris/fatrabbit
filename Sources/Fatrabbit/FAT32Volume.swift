@@ -90,51 +90,257 @@ enum FATError: Error, CustomStringConvertible {
     }
 }
 
+// MARK: - Which of the three
+
+/// Which FAT variant a volume is, and everything that follows from it.
+///
+/// Exactly two things differ between the three, and this carries the first: how wide a table entry
+/// is, and therefore which values at the top of its range mean end-of-chain and bad. The second is
+/// whether the root directory is a relocatable chain or a fixed region outside the cluster space —
+/// `hasRelocatableRoot` here, and `FAT32Volume.RootLocation` in full.
+///
+/// Nothing above the format layer is touched by either. The planners, the copy batching and the
+/// staging work on cluster numbers held as `UInt32` and on `ClusterSet`, and a cluster number is a
+/// cluster number whatever it took to read one off the medium. The safety argument is likewise
+/// untouched, because it is about the order writes reach the disk and not about their encoding.
+enum FATFlavour: Sendable {
+    case fat12, fat16, fat32
+
+    /// The bits of a table entry that carry a cluster number. FAT32 spends 28 of its 32 on it; the
+    /// other two spend all of theirs.
+    var entryMask: UInt32 {
+        switch self {
+        case .fat12: 0x0000_0FFF
+        case .fat16: 0x0000_FFFF
+        case .fat32: 0x0FFF_FFFF
+        }
+    }
+
+    /// The end-of-chain marker this tool writes — all ones, which is what formatters use and what
+    /// the reserved range at the top is defined downwards from.
+    var eoc: UInt32 { entryMask }
+
+    /// Entries at or above this end a chain. A range and not a single value, because the marker a
+    /// volume arrives carrying need not be the one we would have written.
+    var eocThreshold: UInt32 { entryMask & ~UInt32(7) }
+
+    /// The marker for a cluster the medium has failed on. Never read, written or allocated: the
+    /// layout goes around these and the rebuilt table re-marks them.
+    var badCluster: UInt32 { entryMask - 8 }
+
+    /// The three derive from `entryMask` rather than being written out per case, which is the fact
+    /// they express: the reserved values are the top eight of whatever range the entry width gives.
+    /// Their own definition also guarantees they cannot collide with a real cluster number, since
+    /// each variant's cluster-count ceiling sits below its reserved range — FAT16 stops at 65,524
+    /// clusters, so the highest cluster number it can name is 0xFFF5.
+
+    var name: String {
+        switch self {
+        case .fat12: "FAT12"
+        case .fat16: "FAT16"
+        case .fat32: "FAT32"
+        }
+    }
+
+    /// Whether the root directory is an ordinary relocatable chain.
+    ///
+    /// FAT32's root is a file like any other directory's, which is what lets this tool place it on
+    /// the first usable cluster. FAT12 and FAT16 keep theirs in a fixed region between the last
+    /// table and the first data cluster — outside the cluster space, so there is no chain to
+    /// relocate, nothing anywhere pointing at it, and a hard ceiling on how many entries it holds.
+    var hasRelocatableRoot: Bool { self == .fat32 }
+
+    /// Bytes per entry, where an entry occupies a whole number of them.
+    ///
+    /// Nil for FAT12, whose twelve-bit entries share a byte with a neighbour. That is not a detail
+    /// that can be papered over: it is why the block-grouped FAT write path cannot express FAT12 and
+    /// why `SafeDefragmenter.writeFATEntries` sends it down a different one.
+    var wholeEntrySize: Int? {
+        switch self {
+        case .fat12: nil
+        case .fat16: 2
+        case .fat32: 4
+        }
+    }
+
+    /// Where cluster `cluster`'s entry begins in the table, and how much has to be touched to change
+    /// it. Two bytes for FAT12, because twelve bits cannot be addressed on their own.
+    func byteRange(ofCluster cluster: UInt32) -> Range<Int> {
+        switch self {
+        case .fat12:
+            // Three halves of a byte each, which is `cluster + cluster / 2` — the same value as
+            // 3 * cluster / 2 and with no doubling on the way to it.
+            let at = Int(cluster) + Int(cluster) / 2
+            return at ..< at + 2
+        case .fat16:
+            return Int(cluster) * 2 ..< Int(cluster) * 2 + 2
+        case .fat32:
+            return Int(cluster) * 4 ..< Int(cluster) * 4 + 4
+        }
+    }
+
+    /// The entry for `cluster`, out of a table held as raw bytes.
+    func entry(forCluster cluster: UInt32, in table: Span<UInt8>) -> UInt32 {
+        let at = byteRange(ofCluster: cluster).lowerBound
+        switch self {
+        case .fat12:
+            // The pair of bytes holds this entry and half of a neighbour's. An even cluster takes
+            // the low twelve bits, an odd one the high twelve.
+            let pair = UInt32(table.littleEndian(UInt16.self, at: at))
+            return (cluster.isMultiple(of: 2) ? pair : pair >> 4) & entryMask
+        case .fat16:
+            return UInt32(table.littleEndian(UInt16.self, at: at))
+        case .fat32:
+            return table.littleEndian(UInt32.self, at: at) & entryMask
+        }
+    }
+
+    /// Writes `value` as `cluster`'s entry.
+    ///
+    /// FAT12 reads before it writes, because the half of the byte pair belonging to the neighbouring
+    /// entry has to be carried through untouched. The other two overwrite their whole width — which
+    /// for FAT32 means the top four bits go out as zero, exactly as they always have.
+    func setEntry(_ value: UInt32, forCluster cluster: UInt32, in table: inout MutableSpan<UInt8>) {
+        let at = byteRange(ofCluster: cluster).lowerBound
+        switch self {
+        case .fat12:
+            let pair = UInt16(table[at]) | (UInt16(table[at + 1]) << 8)
+            let twelve = UInt16(value & 0x0FFF)
+            let merged = cluster.isMultiple(of: 2) ? (pair & 0xF000) | twelve
+                                                   : (pair & 0x000F) | (twelve << 4)
+            table[at] = UInt8(truncatingIfNeeded: merged)
+            table[at + 1] = UInt8(truncatingIfNeeded: merged >> 8)
+        case .fat16:
+            table.setLittleEndian(UInt16(truncatingIfNeeded: value), at: at)
+        case .fat32:
+            table.setLittleEndian(value, at: at)
+        }
+    }
+
+    /// The clean-shutdown bit within table entry 1, or nil where there is nowhere to put one.
+    ///
+    /// FAT12 is the nil. Twelve bits leave no room for it, so on a FAT12 volume the boot record's
+    /// flag is the whole of the "this volume was being modified" signal — a real reduction in what
+    /// an interruption leaves behind for the operating system to notice, and not an omission here.
+    var cleanShutdownBit: UInt32? {
+        switch self {
+        case .fat12: nil
+        case .fat16: 0x0000_8000
+        case .fat32: 0x0800_0000
+        }
+    }
+
+    /// Offset of the boot record's dirty flag, and of its 11-byte volume label. Both are the same
+    /// field of each variant's extended BPB; they land in different places only because FAT32's BPB
+    /// is the longer one.
+    var bootDirtyFlagOffset: UInt64 { self == .fat32 ? 65 : 37 }
+    var labelOffset: Int { self == .fat32 ? 71 : 43 }
+}
+
 // MARK: - BIOS Parameter Block
 
-/// The subset of FAT32 boot-sector (BPB) fields this tool needs.
+/// The subset of boot-sector (BPB) fields this tool needs, across all three variants.
+///
+/// The order things are worked out in is the order the format itself requires, and it is the whole
+/// reason this is one initialiser rather than a list of assignments. Offsets 36 and upwards mean
+/// different things in different variants — on FAT12/16 they are the drive number, the boot
+/// signature and the volume ID, which read as geometry would be nonsense — so the variant has to be
+/// settled before any of them is touched. It can be: classifying a volume needs only the fields
+/// common to all three, and the cluster count they yield.
 struct BPB {
     let bytesPerSector: Int      // offset 11, u16
     let sectorsPerCluster: Int   // offset 13, u8
     let reservedSectorCount: Int // offset 14, u16
     let numFATs: Int             // offset 16, u8
     let rootEntCnt: Int          // offset 17, u16 (0 for FAT32)
-    let totSec16: Int            // offset 19, u16 (0 for FAT32)
-    let fatSize16: Int           // offset 22, u16 (0 for FAT32)
-    let fatSize32: Int           // offset 36, u32 (sectors per FAT)
+    /// Sectors per FAT: offset 22 where that is non-zero, offset 36 otherwise. The two are
+    /// exclusive by construction — a FAT32 volume writes 0 to the 16-bit field precisely so that a
+    /// reader is forced to come to the 32-bit one.
+    let fatSize: Int
+    let totalSectors: UInt32     // offset 19 (u16) or offset 32 (u32)
+    /// Sectors the fixed root directory occupies; 0 on FAT32, whose root is a chain in the data area
+    /// like any other directory's. It sits between the last table and the first data cluster, so it
+    /// displaces the whole data region — the one piece of geometry FAT32 never has to account for.
+    let rootDirSectors: Int
+    let countOfClusters: UInt32
+    let flavour: FATFlavour
+
+    // FAT32 only, and zero elsewhere, because on FAT12/16 these offsets carry other fields entirely.
     let extFlags: UInt16         // offset 40, u16
     let rootCluster: UInt32      // offset 44, u32
     let fsInfoSector: Int        // offset 48, u16
     let backupBootSector: Int    // offset 50, u16
-    let totalSectors: UInt32     // offset 32, u32
 
-    init(bootSector boot: Span<UInt8>) {
+    init(bootSector boot: Span<UInt8>) throws(FATError) {
         bytesPerSector = Int(boot.littleEndian(UInt16.self, at: 11))
         sectorsPerCluster = Int(boot[13])
         reservedSectorCount = Int(boot.littleEndian(UInt16.self, at: 14))
         numFATs = Int(boot[16])
         rootEntCnt = Int(boot.littleEndian(UInt16.self, at: 17))
-        totSec16 = Int(boot.littleEndian(UInt16.self, at: 19))
-        fatSize16 = Int(boot.littleEndian(UInt16.self, at: 22))
-        fatSize32 = Int(boot.littleEndian(UInt32.self, at: 36))
-        extFlags = boot.littleEndian(UInt16.self, at: 40)
-        rootCluster = boot.littleEndian(UInt32.self, at: 44)
-        fsInfoSector = Int(boot.littleEndian(UInt16.self, at: 48))
-        backupBootSector = Int(boot.littleEndian(UInt16.self, at: 50))
-        let totSec32 = boot.littleEndian(UInt32.self, at: 32)
-        totalSectors = totSec32 != 0 ? totSec32 : UInt32(totSec16)
+
+        guard bytesPerSector == 512 || bytesPerSector == 1024
+            || bytesPerSector == 2048 || bytesPerSector == 4096 else {
+            throw FATError.notFAT32("unexpected bytes-per-sector \(bytesPerSector)")
+        }
+
+        let fatSize16 = Int(boot.littleEndian(UInt16.self, at: 22))
+        fatSize = fatSize16 != 0 ? fatSize16 : Int(boot.littleEndian(UInt32.self, at: 36))
+        let totSec16 = boot.littleEndian(UInt16.self, at: 19)
+        totalSectors = totSec16 != 0 ? UInt32(totSec16) : boot.littleEndian(UInt32.self, at: 32)
+
+        guard sectorsPerCluster > 0, numFATs > 0, fatSize > 0, totalSectors > 0 else {
+            throw FATError.notFAT32("invalid BPB geometry")
+        }
+
+        // Rounded up: a root of 512 entries is 16 KiB, which need not be a whole number of sectors
+        // on a volume with large ones. Zero on FAT32, where `rootEntCnt` is zero — which is what
+        // makes every line below a strict generalisation of the FAT32-only arithmetic it replaces
+        // rather than a change to it, and so what lets a FAT32 run come out byte-identical.
+        rootDirSectors = ((rootEntCnt * DirectoryEntry.size) + bytesPerSector - 1) / bytesPerSector
+
+        let firstDataSector = reservedSectorCount + numFATs * fatSize + rootDirSectors
+        guard Int(totalSectors) > firstDataSector else { throw FATError.notFAT32("no data region") }
+        countOfClusters = UInt32((Int(totalSectors) - firstDataSector) / sectorsPerCluster)
+
+        // The definition, and the only one there is: which variant a volume is follows from how many
+        // data clusters it has and from nothing else. Not from the filesystem-type string in the
+        // boot record, which is a comment and is routinely wrong, and not from the size of the
+        // medium.
+        flavour = switch countOfClusters {
+        case 0 ..< 4085: .fat12
+        case 4085 ..< 65525: .fat16
+        default: .fat32
+        }
+
+        guard countOfClusters >= 1 else { throw FATError.notFAT32("no clusters") }
+
+        if flavour == .fat32 {
+            extFlags = boot.littleEndian(UInt16.self, at: 40)
+            rootCluster = boot.littleEndian(UInt32.self, at: 44)
+            fsInfoSector = Int(boot.littleEndian(UInt16.self, at: 48))
+            backupBootSector = Int(boot.littleEndian(UInt16.self, at: 50))
+            // A cluster count in FAT32 territory but a FAT12/16 root or table size is not a variant
+            // this can classify — it is a damaged or hand-built boot record, and guessing which half
+            // to believe would mean reading the volume through the wrong geometry.
+            guard rootEntCnt == 0, fatSize16 == 0 else {
+                throw FATError.notFAT32("\(countOfClusters) clusters is FAT32, but the boot record "
+                    + "also claims a \(rootEntCnt)-entry fixed root and a 16-bit FAT size")
+            }
+            guard rootCluster >= 2, rootCluster <= countOfClusters + 1 else {
+                throw FATError.notFAT32("root cluster \(rootCluster) is outside the data region")
+            }
+        } else {
+            extFlags = 0
+            rootCluster = 0
+            fsInfoSector = 0
+            backupBootSector = 0
+            // The fixed root is the only way in to a FAT12/16 volume, so a volume claiming none of
+            // it has nothing this tool can walk.
+            guard rootEntCnt > 0 else {
+                throw FATError.notFAT32("\(flavour.name) volume with no root directory entries")
+            }
+        }
     }
-}
-
-// MARK: - FAT constants
-
-enum FAT {
-    static let entryMask: UInt32 = 0x0FFF_FFFF
-    static let eoc: UInt32 = 0x0FFF_FFFF        // end-of-chain marker we write
-    static let eocThreshold: UInt32 = 0x0FFF_FFF8
-    static let badCluster: UInt32 = 0x0FFF_FFF7
-    /// Bytes per entry in the on-disk table. Every entry is 32 bits wide, of which 28 are used.
-    static let entrySize = 4
 }
 
 // MARK: - Sets of clusters
@@ -276,10 +482,26 @@ private struct OpenDescriptor: ~Copyable {
     deinit { close(raw) }
 }
 
-/// A read-write view over a FAT32 partition (device node or image file). The volume is
-/// opened for updating so the defragmenter can relocate clusters in place; callers are
+/// A read-write view over a FAT12, FAT16 or FAT32 partition (device node or image file). The volume
+/// is opened for updating so the defragmenter can relocate clusters in place; callers are
 /// responsible for ensuring the volume is unmounted before mutating it.
 final class FAT32Volume {
+    /// Where the root directory's entries live.
+    ///
+    /// On FAT32 the root is a file like any other directory, so this is a first cluster and the
+    /// defragmenter treats the root as one more object to place — on the lowest cluster, in fact.
+    /// On FAT12 and FAT16 it is a fixed region between the last table and the first data cluster:
+    /// outside the cluster space, so nothing anywhere points at it, nothing can relocate it, and it
+    /// holds exactly as many entries as it was formatted with, for ever.
+    ///
+    /// A case each rather than one being made to imitate the other. Representing the fixed region as
+    /// a pretend chain would put numbers in `ClusterSet`s that are not cluster numbers, and every
+    /// piece of arithmetic downstream would be one mistake away from writing over the data area.
+    enum RootLocation: Sendable, Equatable {
+        case chain(UInt32)
+        case region(offset: UInt64, size: Int)
+    }
+
     private let file: OpenDescriptor
     /// The descriptor every transfer goes through. `pread`/`pwrite` carry their own offset, so there
     /// is no shared seek position and nothing to keep in step.
@@ -295,10 +517,19 @@ final class FAT32Volume {
     let fatStartOffset: UInt64
     let dataStartOffset: UInt64
     let activeFatIndex: Int
+    /// Which of the three this is. Everything width-dependent goes through it.
+    let flavour: FATFlavour
+    let rootLocation: RootLocation
+    /// Bytes one copy of the table occupies, which is where the next copy begins.
+    let fatByteCount: Int
 
-    /// The active FAT decoded as 28-bit entries, indexed by cluster number.
+    /// The active FAT decoded into one entry per cluster, widened to `UInt32` whatever its on-disk
+    /// width, and indexed by cluster number.
     let fat: [UInt32]
-    /// The first eight raw bytes of the FAT (reserved entries 0 and 1) preserved verbatim.
+    /// The raw bytes of reserved entries 0 and 1, preserved verbatim — three on FAT12, four on
+    /// FAT16, eight on FAT32. Entry 0 holds a copy of the media descriptor and entry 1 the
+    /// clean-shutdown flag, neither of which this tool has any business deciding, so where a write
+    /// path has to reproduce the head of the table it reproduces these rather than re-encoding them.
     let fatReservedBytes: [UInt8]
     /// Clusters the FAT marks as bad. These are never read, written, or allocated: the
     /// defragmenter lays out around them and re-marks them in the rebuilt FAT.
@@ -334,46 +565,55 @@ final class FAT32Volume {
         // Boot sector lives at offset 0. Read a generous 512 bytes first to learn the
         // sector size, which is enough for every BPB field we touch.
         let boot = try FAT32Volume.read(opened, blockSize: blockSize, at: 0, count: 512)
-        let bpb = BPB(bootSector: boot.span)
+        // Geometry, and which of the three this is, are settled together: the classification follows
+        // from the cluster count and the cluster count follows from the geometry, so neither can be
+        // had without the other. Everything that used to be checked out here is checked in there.
+        let bpb = try BPB(bootSector: boot.span)
         self.bpb = bpb
-
-        guard bpb.bytesPerSector == 512 || bpb.bytesPerSector == 1024
-            || bpb.bytesPerSector == 2048 || bpb.bytesPerSector == 4096 else {
-            throw FATError.notFAT32("unexpected bytes-per-sector \(bpb.bytesPerSector)")
-        }
-        guard bpb.sectorsPerCluster > 0, bpb.numFATs > 0, bpb.fatSize32 > 0 else {
-            throw FATError.notFAT32("invalid BPB geometry")
-        }
-        guard bpb.rootEntCnt == 0, bpb.fatSize16 == 0 else {
-            throw FATError.notFAT32("this looks like FAT12/FAT16, not FAT32")
-        }
+        let flavour = bpb.flavour
+        self.flavour = flavour
 
         clusterSize = bpb.bytesPerSector * bpb.sectorsPerCluster
+        countOfClusters = bpb.countOfClusters
 
         // BS_VolLab: 11 bytes, space-padded, and unlike a short name it may contain spaces, so only
         // the trailing padding comes off. "NO NAME" is what a formatter writes when asked for
         // nothing, and is no more use than an empty string.
-        let rawLabel = boot.span.oemText(71 ..< 82)
+        let rawLabel = boot.span.oemText(flavour.labelOffset ..< flavour.labelOffset + 11)
             .trimmingCharacters(in: .whitespaces)
         label = rawLabel == "NO NAME" ? "" : rawLabel
 
-        let fatSectors = bpb.numFATs * bpb.fatSize32
-        let dataSectors = Int(bpb.totalSectors) - bpb.reservedSectorCount - fatSectors
-        guard dataSectors > 0 else { throw FATError.notFAT32("no data region") }
-        let clusters = UInt32(dataSectors / bpb.sectorsPerCluster)
-        guard clusters >= 65525 else {
-            throw FATError.notFAT32("cluster count \(clusters) is below the FAT32 minimum")
-        }
-        countOfClusters = clusters
-
+        let fatSectors = bpb.numFATs * bpb.fatSize
         fatStartOffset = UInt64(bpb.reservedSectorCount) * UInt64(bpb.bytesPerSector)
-        dataStartOffset = UInt64(bpb.reservedSectorCount + fatSectors) * UInt64(bpb.bytesPerSector)
+        // The fixed root sits between the last table and the first data cluster, so it pushes the
+        // data region down by its own length. On FAT32 `rootDirSectors` is zero and this is the same
+        // arithmetic it always was.
+        let rootRegionStart = UInt64(bpb.reservedSectorCount + fatSectors) * UInt64(bpb.bytesPerSector)
+        dataStartOffset = rootRegionStart + UInt64(bpb.rootDirSectors) * UInt64(bpb.bytesPerSector)
 
-        // Respect mirroring flags to pick which physical FAT is authoritative.
-        let mirroringDisabled = (bpb.extFlags & 0x0080) != 0
+        rootLocation = switch flavour {
+        case .fat32: .chain(bpb.rootCluster)
+        case .fat12, .fat16: .region(offset: rootRegionStart,
+                                     size: bpb.rootEntCnt * DirectoryEntry.size)
+        }
+
+        // Respect mirroring flags to pick which physical FAT is authoritative. FAT32 only: the other
+        // two have no such flag, always keep every copy in step, and so are read from the first.
+        let mirroringDisabled = flavour == .fat32 && (bpb.extFlags & 0x0080) != 0
         activeFatIndex = mirroringDisabled ? Int(bpb.extFlags & 0x000F) : 0
 
-        let fatByteCount = bpb.fatSize32 * bpb.bytesPerSector
+        let fatByteCount = bpb.fatSize * bpb.bytesPerSector
+        self.fatByteCount = fatByteCount
+        let entriesNeeded = Int(bpb.countOfClusters) + 2
+        // A table too small to hold the entries its own geometry implies cannot be read at all —
+        // and reading it anyway would run off the end of the buffer, which under `-Ounchecked` is
+        // not a trap but a wrong answer.
+        let bytesNeeded = flavour.byteRange(ofCluster: UInt32(entriesNeeded - 1)).upperBound
+        guard bytesNeeded <= fatByteCount else {
+            throw FATError.notFAT32("\(flavour.name) table of \(fatByteCount) bytes is too small "
+                + "for the \(entriesNeeded) entries \(bpb.countOfClusters) clusters need")
+        }
+
         let fatRaw = try FAT32Volume.read(opened,
                                           blockSize: blockSize,
                                           at: fatStartOffset + UInt64(activeFatIndex * fatByteCount),
@@ -381,21 +621,19 @@ final class FAT32Volume {
         // Decoded through one borrowed window over the bytes just read, rather than a bounds-checked
         // array subscript per byte: a 32 GB card's FAT is two million entries, and this is the first
         // thing a run does.
-        let entriesNeeded = Int(clusters) + 2
         var decoded = [UInt32](repeating: 0, count: entriesNeeded)
         do {
             let table = fatRaw.span
             var entries = decoded.mutableSpan
             for index in 0 ..< entriesNeeded {
-                entries[index] = table.littleEndian(UInt32.self, at: index * FAT.entrySize)
-                    & FAT.entryMask
+                entries[index] = flavour.entry(forCluster: UInt32(index), in: table)
             }
         }
         fat = decoded
-        fatReservedBytes = Array(fatRaw[0 ..< 8])
+        fatReservedBytes = Array(fatRaw[0 ..< flavour.byteRange(ofCluster: 2).lowerBound])
 
         var bad = Set<UInt32>()
-        for c in 2 ..< entriesNeeded where decoded[c] == FAT.badCluster {
+        for c in 2 ..< entriesNeeded where decoded[c] == flavour.badCluster {
             bad.insert(UInt32(c))
         }
         badClusters = bad
@@ -991,10 +1229,10 @@ final class FAT32Volume {
     func chain(startingAt start: UInt32) throws(FATError) -> [UInt32] {
         var result: [UInt32] = []
         var visited = Set<UInt32>()
-        var c = start & FAT.entryMask
+        var c = start & flavour.entryMask
         while true {
             if c < 2 || c > countOfClusters + 1 {
-                if c >= FAT.eocThreshold { return result }   // proper end-of-chain
+                if c >= flavour.eocThreshold { return result }   // proper end-of-chain
                 if c == 0 { throw FATError.corruption("free cluster inside chain from \(start)") }
                 throw FATError.corruption("invalid cluster \(c) inside chain from \(start)")
             }
@@ -1002,8 +1240,8 @@ final class FAT32Volume {
                 throw FATError.corruption("cluster loop detected in chain from \(start)")
             }
             result.append(c)
-            let next = fat[Int(c)] & FAT.entryMask
-            if next == FAT.badCluster { throw FATError.corruption("bad cluster \(c) in chain") }
+            let next = fat[Int(c)] & flavour.entryMask
+            if next == flavour.badCluster { throw FATError.corruption("bad cluster \(c) in chain") }
             c = next
         }
     }

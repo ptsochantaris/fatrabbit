@@ -3,15 +3,20 @@ import Foundation
 // MARK: - Argument parsing
 
 let usage = """
-fatrabbit — relocates the cluster chains of a FAT32 volume in place so that every file
-and directory occupies a single contiguous run, then rewrites the FATs and boot record
-to match.
+fatrabbit — relocates the cluster chains of a FAT12, FAT16 or FAT32 volume in place so
+that every file and directory occupies a single contiguous run, then rewrites the FATs
+and boot record to match.
 
 USAGE:
     fatrabbit <volume> [options]
 
 ARGUMENTS:
-    <volume>             Unmounted FAT32 device node (e.g. \(System.exampleDevice)) or image file.
+    <volume>             Unmounted FAT device node (e.g. \(System.exampleDevice)) or image file.
+                         Which variant it is follows from the volume's own cluster count and
+                         is worked out on opening; exFAT is a different filesystem and is not
+                         supported. On FAT12 and FAT16 the root directory lives in a fixed
+                         region outside the cluster space, so it is never relocated — and it
+                         cannot hold more entries than it was formatted for.
 \(System.nodeAdvice)
                          The volume is modified in place, but never destructively: data is
                          only ever copied into free clusters before anything is repointed,
@@ -180,11 +185,16 @@ func defragment(_ options: Options, report: Reporter) throws(FATError) -> Bool {
 
     let volume = try FAT32Volume(path: source, dryRun: options.dryRun)
     report.post(.opened(RunEvent.Geometry(label: volume.label,
+                                          flavour: volume.flavour.name,
                                           clusterSize: volume.clusterSize,
                                           clusterCount: volume.countOfClusters,
                                           bytesPerSector: volume.bpb.bytesPerSector,
-                                          sectorsPerCluster: volume.bpb.sectorsPerCluster)))
-    report.post(.layout(ClusterState.layout(of: volume.fat, clusterCount: volume.countOfClusters)))
+                                          sectorsPerCluster: volume.bpb.sectorsPerCluster,
+                                          fixedRootEntries: volume.flavour.hasRelocatableRoot
+                                              ? nil : volume.bpb.rootEntCnt)))
+    report.post(.layout(ClusterState.layout(of: volume.fat,
+                                            clusterCount: volume.countOfClusters,
+                                            badMarker: volume.flavour.badCluster)))
     report.update { $0.badClusters = volume.badClusters.count }
 
     report.phase(.scanning)
@@ -196,7 +206,8 @@ func defragment(_ options: Options, report: Reporter) throws(FATError) -> Bool {
                                       first: options.first,
                                       last: options.last,
                                       capacity: volume.countOfClusters,
-                                      fast: options.fast)
+                                      fast: options.fast,
+                                      movableRoot: volume.flavour.hasRelocatableRoot)
     report.update {
         $0.filesFound = plan.fileCount
         $0.directoriesFound = plan.directoryCount

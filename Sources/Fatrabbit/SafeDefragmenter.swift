@@ -158,6 +158,20 @@ final class SafeDefragmenter {
         freeClusters += UInt32(count)
     }
 
+    /// Which clusters a byte range falls in, for colouring the map — and none at all where it falls
+    /// outside the data region.
+    ///
+    /// That second case is a FAT12/16 root, whose fixed region sits below the first cluster. The map
+    /// draws the data area and has no cell for the region, so the honest answer is to light nothing:
+    /// `cluster(atOffset:)` would clamp to cluster 2 and paint work onto a cluster the run is not
+    /// touching.
+    private func clusters(coveredBy offset: UInt64, count: Int) -> ClusterSet {
+        guard offset >= volume.dataStartOffset else { return .list([]) }
+        let first = volume.cluster(atOffset: offset)
+        let last = volume.cluster(atOffset: offset + UInt64(max(count, 1) - 1))
+        return .run(first ..< last + 1)
+    }
+
     // MARK: - Top level
 
     func run() throws(FATError) {
@@ -215,12 +229,21 @@ final class SafeDefragmenter {
 
             // Erase the directory entries first. Marking an entry deleted is a one-byte write,
             // so a name is either there or gone, never half-removed.
-            for (cluster, offsets) in cleanup.removals {
-                report.post(.working(RunEvent.Work(.clearing, [cluster])))
-                var data = try volume.readCluster(cluster)
-                for offset in offsets where offset + 32 <= data.count { data[offset] = 0xE5 }
-                try volume.writeCluster(cluster, data)
-                report.post(.working(RunEvent.Work(.clearing, [cluster], done: true)))
+            //
+            // Taken in device order, and covering only the span the edits actually fall in rather
+            // than the whole run holding them: the same shape as `unhideDotEntries` below, and the
+            // reason both can be expressed against a device offset alone. A run is usually a cluster
+            // and on a FAT12/16 volume it can be the root's fixed region, which has no cluster
+            // number to be read by — and it is where the root-level metadata being stripped lives.
+            for (at, offsets) in cleanup.removals.sorted(by: { $0.key < $1.key }) {
+                guard let low = offsets.min(), let high = offsets.max() else { continue }
+                let span = high + DirectoryEntry.size - low
+                let lit = clusters(coveredBy: at + UInt64(low), count: span)
+                report.post(.working(RunEvent.Work(.clearing, lit)))
+                try volume.updateBytes(at: at + UInt64(low), count: span) { window in
+                    for offset in offsets { window[offset - low] = 0xE5 }
+                }
+                report.post(.working(RunEvent.Work(.clearing, lit, done: true)))
             }
             try volume.synchronize()
 
@@ -250,30 +273,33 @@ final class SafeDefragmenter {
     private func unhideDotEntries() throws(FATError) {
         guard let cleanup, !cleanup.hiddenDots.isEmpty else { return }
 
-        // Grouped by cluster, and taken in cluster order: `.` and `..` sit side by side, so between
-        // them they cost one read-modify-write rather than one each, and the writes then run up the
-        // volume rather than hopping about it.
-        let byCluster = Dictionary(grouping: cleanup.hiddenDots, by: \.cluster)
+        // Grouped by the run of directory data holding them, and taken in device order: `.` and `..`
+        // sit side by side, so between them they cost one read-modify-write rather than one each, and
+        // the writes then run up the volume rather than hopping about it.
+        let byRun = Dictionary(grouping: cleanup.hiddenDots, by: \.at)
             .sorted { $0.key < $1.key }
 
         report.update {
             $0.hiddenAttributesFound = cleanup.hiddenDots.count
-            $0.hiddenAttributeDirectories = byCluster.count
+            $0.hiddenAttributeDirectories = byRun.count
         }
         report.phase(.clearingHiddenAttributes)
         let started = ContinuousClock.now
         var changed = 0
-        for group in byCluster {
+        for group in byRun {
             if Interruption.requested { break }
 
-            report.post(.working(RunEvent.Work(.repointing, [group.key])))
             let offsets = group.value.map(\.offset)
             let low = offsets.min() ?? 0
-            let span = (offsets.max() ?? 0) + 32 - low
-            try volume.updateBytes(at: volume.offset(ofCluster: group.key) + UInt64(low), count: span) {
-                for offset in offsets { $0[offset - low + 11] &= ~UInt8(0x02) }
+            let span = (offsets.max() ?? 0) + DirectoryEntry.size - low
+            let lit = clusters(coveredBy: group.key + UInt64(low), count: span)
+            report.post(.working(RunEvent.Work(.repointing, lit)))
+            try volume.updateBytes(at: group.key + UInt64(low), count: span) {
+                for offset in offsets {
+                    $0[offset - low + DirectoryEntry.attributesOffset] &= ~UInt8(0x02)
+                }
             }
-            report.post(.working(RunEvent.Work(.repointing, [group.key], done: true)))
+            report.post(.working(RunEvent.Work(.repointing, lit, done: true)))
             changed += offsets.count
             // One update per directory, which is the pace of the write above: anything drawing from
             // this then moves whenever the thing being waited on does.
@@ -290,7 +316,7 @@ final class SafeDefragmenter {
         var orphans: [UInt32] = []
         for cluster in 2 ... lastCluster {
             let entry = fat[Int(cluster)]
-            if entry != 0, entry != FAT.badCluster, ownerIndex[Int(cluster)] < 0 {
+            if entry != 0, entry != volume.flavour.badCluster, ownerIndex[Int(cluster)] < 0 {
                 orphans.append(cluster)
             }
         }
@@ -456,7 +482,7 @@ final class SafeDefragmenter {
         var claimed: UInt32 = 0
         for i in 0 ..< run.count {
             if fat[Int(run[i])] == 0 { claimed += 1 }
-            fat[Int(run[i])] = (i == run.count - 1) ? FAT.eoc : run[i + 1]
+            fat[Int(run[i])] = (i == run.count - 1) ? volume.flavour.eoc : run[i + 1]
         }
         // Count what was actually taken from the free pool rather than assuming the whole run
         // came from it, so the tally cannot drift out of step with the FAT.
@@ -490,9 +516,11 @@ final class SafeDefragmenter {
     private func collectRepoint(_ object: FSObject, to newStart: UInt32,
                                into edits: inout [(offset: UInt64, cluster: UInt32)]) throws(FATError) {
         if object.isRoot {
+            // Only reachable on FAT32, whose root is named by the boot record and nothing else. A
+            // FAT12/16 root cannot move, so it is never in the schedule to arrive here.
             try writeRootCluster(newStart)
         } else if let parent = object.parent,
-                  let offset = pointerField(in: parent.chain, atOffset: object.entryOffset) {
+                  let offset = pointerField(in: parent, atOffset: object.entryOffset) {
             edits.append((offset, newStart))
         }
 
@@ -530,6 +558,21 @@ final class SafeDefragmenter {
         return volume.offset(ofCluster: chain[index])
             + UInt64(offset % clusterSize)
             + UInt64(DirectoryEntry.pointerFieldOffset)
+    }
+
+    /// The same, for a directory that might have no clusters to resolve against.
+    ///
+    /// The one that does is a FAT12/16 root, and this is the whole of what its being a fixed region
+    /// costs the engine: every root-level object's pointer flip is a write into its parent, that
+    /// parent is the root, and on those two variants the root's data is at a fixed offset rather
+    /// than wherever its chain currently runs. Everything else goes through the chain form above,
+    /// unchanged — including the root itself on FAT32.
+    private func pointerField(in directory: FSObject, atOffset offset: Int) -> UInt64? {
+        guard let fixedAt = directory.fixedAt else {
+            return pointerField(in: directory.chain, atOffset: offset)
+        }
+        guard case .region(_, let size) = volume.rootLocation, offset < size else { return nil }
+        return fixedAt + UInt64(offset) + UInt64(DirectoryEntry.pointerFieldOffset)
     }
 
     /// As `writeEntryStart`, but for data this generation has only just copied: offered to the copy
@@ -689,9 +732,16 @@ final class SafeDefragmenter {
     private func writeFATEntries(_ clusters: [UInt32],
                                 showing: RunEvent.Activity? = nil) throws(FATError) {
         guard !clusters.isEmpty else { return }
+        // FAT12 cannot be written this way at all, and takes the whole-table path instead. Its
+        // twelve-bit entries share bytes across block boundaries, which breaks the property
+        // everything below rests on — see `writeWholeFAT`.
+        guard let entrySize = volume.flavour.wholeEntrySize else {
+            try writeWholeFAT(clusters, showing: showing)
+            return
+        }
         let blockSize = volume.blockSize
-        let entriesPerBlock = UInt32(blockSize / 4)
-        let fatByteCount = volume.bpb.fatSize32 * volume.bpb.bytesPerSector
+        let entriesPerBlock = UInt32(blockSize / entrySize)
+        let fatByteCount = volume.fatByteCount
 
         // Grouped by the block each entry lands in rather than by runs of consecutive clusters.
         // A 512-byte block holds 128 entries, so two runs a single cluster apart used to cost a
@@ -743,14 +793,22 @@ final class SafeDefragmenter {
                 var table = bytes.mutableSpan
                 for index in 0 ..< Int(entries) {
                     let cluster = Int(first) + index
-                    table.setLittleEndian(cluster < fat.count ? fat[cluster] : 0,
-                                          at: index * FAT.entrySize)
+                    let value = cluster < fat.count ? fat[cluster] : 0
+                    // Written at the entry's own width. Both widths that reach here are whole bytes
+                    // and fixed, so an entry's place in the buffer is its index times that width and
+                    // nothing about its cluster number enters into it — which is exactly what is not
+                    // true of FAT12, and why FAT12 is not here.
+                    if entrySize == 2 {
+                        table.setLittleEndian(UInt16(truncatingIfNeeded: value), at: index * 2)
+                    } else {
+                        table.setLittleEndian(value, at: index * 4)
+                    }
                 }
             }
 
             for copy in 0 ..< volume.bpb.numFATs {
                 let offset = volume.fatStartOffset + UInt64(copy * fatByteCount)
-                    + UInt64(first) * UInt64(FAT.entrySize)
+                    + UInt64(Int(first) * entrySize)
                 if run.first == 0 {
                     // The exception. The first block also holds entries 0 and 1, and entry 1 carries
                     // the "volume is being modified" flag, which `setDirty` maintains on the disk and
@@ -761,9 +819,11 @@ final class SafeDefragmenter {
                     try volume.updateBytes(at: offset, count: prepared.count) { window in
                         let source = prepared.span
                         var target = window.mutableSpan
-                        for index in 2 ..< Int(entries) {
-                            let at = index * FAT.entrySize
-                            target.setLittleEndian(source.littleEndian(UInt32.self, at: at), at: at)
+                        // Everything past the reserved pair, as one byte range: entries here are
+                        // fixed-width, so "all but the first two" has a single boundary rather than
+                        // needing a walk entry by entry.
+                        for byte in 2 * entrySize ..< prepared.count {
+                            target[byte] = source[byte]
                         }
                     }
                 } else {
@@ -775,6 +835,57 @@ final class SafeDefragmenter {
             if let showing, let touched {
                 report.post(.working(RunEvent.Work(showing, touched, step: step,
                                                    steps: runs.count, done: true)))
+            }
+        }
+    }
+
+    /// Writes the table entire, to every copy, which is what FAT12 does instead of the above.
+    ///
+    /// A twelve-bit entry shares a byte with one of its neighbours, and that shared byte can be the
+    /// last of a block. So the property the block-grouped path rests on — that a block can be
+    /// written straight from the working copy without reading what is already there — does not hold:
+    /// the first and last entry of every block are half-owned by the block next door. Rewriting the
+    /// table whole sidesteps that rather than handling it, and can afford to, because a FAT12 table
+    /// is at most 4,084 entries: some 6 KiB, against the 128 KiB a full FAT16 table reaches. There is
+    /// no version of a FAT12 volume where this is expensive.
+    ///
+    /// The reserved pair is copied from what the volume arrived carrying rather than re-encoded from
+    /// the working table, which is what makes the first-block special case above unnecessary here:
+    /// entry 0's media descriptor and whatever entry 1 holds go back exactly as they were, so there
+    /// is no stale dirty flag to put back and nothing for `setDirty` to fight with. On FAT12 there
+    /// is no clean-shutdown bit in entry 1 to begin with.
+    private func writeWholeFAT(_ clusters: [UInt32],
+                               showing: RunEvent.Activity?) throws(FATError) {
+        let flavour = volume.flavour
+        let fatByteCount = volume.fatByteCount
+        var bytes = [UInt8](repeating: 0, count: fatByteCount)
+        do {
+            var table = bytes.mutableSpan
+            for cluster in 2 ..< fat.count {
+                flavour.setEntry(fat[cluster], forCluster: UInt32(cluster), in: &table)
+            }
+            // Verbatim, and last, so it cannot be disturbed by the entry-2 write sharing a byte with
+            // it — which on FAT12 it does not, the pair filling bytes 0 to 2 exactly, but the order
+            // costs nothing and does not depend on that holding.
+            let reserved = volume.fatReservedBytes
+            for index in 0 ..< reserved.count { table[index] = reserved[index] }
+        }
+
+        // One transfer per copy, and the whole table each time, so there is one step to report rather
+        // than a sweep. What is lit is the clusters whose entries changed, not the whole table: the
+        // rest is being carried along untouched, exactly as in the block-grouped path.
+        let lit = ClusterSet.list(clusters.sorted())
+        report.update { $0.fatBlocksTouched += (fatByteCount / volume.blockSize) * volume.bpb.numFATs }
+        for copy in 0 ..< volume.bpb.numFATs {
+            if let showing {
+                report.post(.working(RunEvent.Work(showing, lit, step: copy,
+                                                   steps: volume.bpb.numFATs)))
+            }
+            try volume.writeBytes(bytes, at: volume.fatStartOffset + UInt64(copy * fatByteCount))
+            report.update { $0.fatWrites += 1 }
+            if let showing {
+                report.post(.working(RunEvent.Work(showing, lit, step: copy,
+                                                   steps: volume.bpb.numFATs, done: true)))
             }
         }
     }
@@ -877,7 +988,8 @@ final class SafeDefragmenter {
         let clusters = Array(pendingFrees)
         pendingFrees.removeAll(keepingCapacity: true)
         var released = 0
-        for cluster in clusters where fat[Int(cluster)] != FAT.badCluster && ownerIndex[Int(cluster)] < 0 {
+        for cluster in clusters where fat[Int(cluster)] != volume.flavour.badCluster
+            && ownerIndex[Int(cluster)] < 0 {
             fat[Int(cluster)] = 0
             released += 1
         }
@@ -924,23 +1036,32 @@ final class SafeDefragmenter {
 
         let bpb = volume.bpb
         let bps = bpb.bytesPerSector
-        let rootStart = objects.first?.chain.first ?? bpb.rootCluster
 
-        var reserved = try volume.readBytes(at: 0, count: bpb.reservedSectorCount * bps)
-        patchBootSector(&reserved, at: 0, rootStart: rootStart)
-        patchFSInfo(&reserved, sector: bpb.fsInfoSector, bps: bps, free: free, next: nextFree)
-        if bpb.backupBootSector > 0 {
-            patchBootSector(&reserved, at: bpb.backupBootSector * bps, rootStart: rootStart)
-            patchFSInfo(&reserved, sector: bpb.backupBootSector + 1, bps: bps, free: free, next: nextFree)
+        // Everything below this point is FAT32's boot record: the root cluster, the mirroring flag,
+        // and the FSInfo sector. FAT12/16 have none of the three — their root is at a fixed place
+        // that cannot have changed, they have no mirroring flag, and they carry no free-cluster
+        // count — so there is nothing in their reserved region for a completed run to bring up to
+        // date, and the whole of this is skipped rather than written past.
+        if volume.flavour.hasRelocatableRoot {
+            let rootStart = objects.first?.chain.first ?? bpb.rootCluster
+
+            var reserved = try volume.readBytes(at: 0, count: bpb.reservedSectorCount * bps)
+            patchBootSector(&reserved, at: 0, rootStart: rootStart)
+            patchFSInfo(&reserved, sector: bpb.fsInfoSector, bps: bps, free: free, next: nextFree)
+            if bpb.backupBootSector > 0 {
+                patchBootSector(&reserved, at: bpb.backupBootSector * bps, rootStart: rootStart)
+                patchFSInfo(&reserved, sector: bpb.backupBootSector + 1, bps: bps,
+                            free: free, next: nextFree)
+            }
+            try volume.writeBytes(reserved, at: 0)
+            try volume.synchronize()
         }
-        try volume.writeBytes(reserved, at: 0)
-        try volume.synchronize()
 
         try setDirty(false)
     }
 
     /// Patches the boot sector at `offset`: root cluster, and mirroring forced on to match the
-    /// identical FAT copies every write keeps in step.
+    /// identical FAT copies every write keeps in step. FAT32 only — both fields are its own.
     private func patchBootSector(_ buf: inout [UInt8], at offset: Int, rootStart: UInt32) {
         guard offset + 512 <= buf.count else { return }
         buf.setLittleEndian(UInt16(0), at: offset + 40)
@@ -958,24 +1079,44 @@ final class SafeDefragmenter {
     }
 
     /// Marks the volume dirty for the duration of the run, so that an interruption is visible
-    /// to the operating system and gets checked rather than silently mounted. FAT entry 1
-    /// carries the clean-shutdown bit; the boot sector carries the flag Windows looks at.
-    /// Entry 1 is read-modify-written raw so its reserved high bits survive untouched.
+    /// to the operating system and gets checked rather than silently mounted.
+    ///
+    /// Two flags, and not every variant has both. Table entry 1 carries the clean-shutdown bit —
+    /// bit 27 on FAT32, bit 15 on FAT16 — and is read-modify-written at its own width so the
+    /// reserved bits around it survive untouched. The boot record carries the flag Windows looks at,
+    /// at offset 65 on FAT32 and offset 37 on the other two: the same field of each variant's
+    /// extended BPB, landing in a different place only because FAT32's BPB is the longer one.
+    ///
+    /// **FAT12 has no clean-shutdown bit**, twelve bits leaving no room for one, so there the boot
+    /// flag is the whole of the signal. That is a real reduction in this guarantee on FAT12 rather
+    /// than an oversight here — a FAT12 volume interrupted mid-run is flagged in the boot record and
+    /// nowhere else — and it is the reason `cleanShutdownBit` is an optional rather than a constant.
     private func setDirty(_ dirty: Bool) throws(FATError) {
-        let fatByteCount = volume.bpb.fatSize32 * volume.bpb.bytesPerSector
-        for copy in 0 ..< volume.bpb.numFATs {
-            let offset = volume.fatStartOffset + UInt64(copy * fatByteCount)
-                + UInt64(FAT.entrySize)
-            var raw = try volume.readBytes(at: offset, count: FAT.entrySize)
-            var value = raw.littleEndian(UInt32.self, at: 0)
-            if dirty { value &= ~UInt32(0x0800_0000) } else { value |= 0x0800_0000 }
-            raw.setLittleEndian(value, at: 0)
-            try volume.writeBytes(raw, at: offset)
+        let flavour = volume.flavour
+        if let bit = flavour.cleanShutdownBit {
+            let field = flavour.byteRange(ofCluster: 1)
+            for copy in 0 ..< volume.bpb.numFATs {
+                let offset = volume.fatStartOffset + UInt64(copy * volume.fatByteCount)
+                    + UInt64(field.lowerBound)
+                var raw = try volume.readBytes(at: offset, count: field.count)
+                // Read at the entry's own width, so the bytes either side of a 16-bit entry 1 are
+                // never in the window to be disturbed in the first place.
+                var value = field.count == 2 ? UInt32(raw.littleEndian(UInt16.self, at: 0))
+                                             : raw.littleEndian(UInt32.self, at: 0)
+                if dirty { value &= ~bit } else { value |= bit }
+                if field.count == 2 {
+                    raw.setLittleEndian(UInt16(truncatingIfNeeded: value), at: 0)
+                } else {
+                    raw.setLittleEndian(value, at: 0)
+                }
+                try volume.writeBytes(raw, at: offset)
+            }
         }
 
-        var flags = try volume.readBytes(at: 65, count: 1)
+        let flagAt = flavour.bootDirtyFlagOffset
+        var flags = try volume.readBytes(at: flagAt, count: 1)
         flags[0] = dirty ? (flags[0] | 0x01) : (flags[0] & ~UInt8(0x01))
-        try volume.writeBytes(flags, at: 65)
+        try volume.writeBytes(flags, at: flagAt)
         try volume.synchronize()
     }
 

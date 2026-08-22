@@ -23,6 +23,51 @@ they are handed out in attach order and the number this drive had last session b
 CoreSimulator volume the next. Card figures still appear below as a record, but nothing is being
 measured on one at present.
 
+## Adding FAT16 and FAT12
+
+The gate that mattered here was not "does FAT16 work" but **"is FAT32 still bit-for-bit what it
+was"**, because every geometry change was written as a generalisation that reduces to the old
+arithmetic when `rootEntCnt` and `fatSize16` are zero. If that is true, it is provable; if it is
+nearly true, it is a corruption waiting for someone else's card. So:
+
+| Gate | Result |
+| --- | --- |
+| FAT32 A/B, spinning drive, raw node, 2 GiB / 131,007 clusters / 42,000 files | **bytes identical, files identical**, 123s vs 124s |
+| FAT32 A/B, same again with `--deMac` | **bytes identical, files identical** |
+| FAT32 A/B, image, 9,006 files | bytes identical, files identical |
+
+The `--deMac` row is there because that path was not merely widened but reshaped: erasing directory
+entries used to read and write the whole cluster holding them and now covers only the span the edits
+fall in, which is what let one code path serve both a cluster and a fixed root region. Fewer
+transfers, same bytes — but "same bytes" is a claim about a write path and had to be shown rather
+than argued.
+
+Then the new variants, all with `fatread.py` before/after, `contiguity.py`, and `fsck_msdos -n`:
+
+| Volume | Where | Before → after |
+| --- | --- | --- |
+| FAT16, 32,763 clusters, 3,046 files | image | 709 free runs → 1; high-water 6,957 → 5,624 |
+| FAT16, 32,763 clusters, 1,206 files | **spinning drive** | 3 fragmented → 0; 612 free runs → 1 |
+| FAT16 with `--deMac` | image | all six root-level metadata entries stripped from the fixed region |
+| FAT12, 2,045 clusters, 78 files | image | 37 free runs → 1; high-water 217 → 167 |
+
+Every one: all files byte-identical, 0 objects fragmented, fsck clean, and remounts.
+
+Two notes on what those rows are worth. **The FAT12 row is stronger than it looks** — 133 moves
+rewrote essentially the whole table, and an independent 12-bit decoder read every chain back
+afterwards, which it could only do if the packed encode is right for both odd and even clusters.
+**The FAT16-on-hardware row is weaker than it looks**: what hardware catches that an image does not
+is how bytes reach the medium, and that path is entirely shared and unchanged. The FAT16 differences
+are addressing and encoding, which an image exercises just as well. It was run because it was cheap,
+not because the image result was in doubt.
+
+`SPINTEST` was snapshotted before any of this and restored from that snapshot afterwards, verified
+byte-for-byte by digest, so the measurement baseline below is the same volume it always was.
+
+One thing was not verified: `make linux`, because no Docker daemon was running. The change touches no
+platform file and adds no `#if os`, so there is nothing new for the seam to differ about — but that
+is an argument, not a check.
+
 ## Where the run stands now
 
 The re-baseline the driver change asked for. Spinning drive, raw node, `SPINTEST` rebuilt to the
@@ -91,7 +136,8 @@ and locking layers. None of it moved a planning decision.
 
 | Script | What it does |
 | --- | --- |
-| `fatread.py` | Reads every file out of a FAT32 volume by following the FAT, so two volumes can be compared without mounting either |
+| `fatread.py` | Reads every file out of a FAT12/16/32 volume by following the FAT, so two volumes can be compared without mounting either |
+| `contiguity.py` | Checks the *claim* rather than the data: every object one extent, free space one run. `fatread.py` proves nothing was lost; this proves the run was worth making, and exits non-zero when it was not |
 | `make-test-volume.py` | Builds a fragmented volume of the right shape to measure against — `small` for the operation-bound shape the tool exists for, `mixed` as a bandwidth-bound control, `hollow` when the *schedule* is what is being measured rather than the copy path |
 | `medium-baseline.py` | Reports a medium's sequential throughput and its per-operation latency, read-only |
 | `ptyrun.py` | Runs the tool on a real pseudo-terminal of a chosen size, capturing every byte — the only way to exercise the block-map display, which switches itself off when output is redirected |
