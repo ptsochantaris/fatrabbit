@@ -98,7 +98,8 @@ struct Fatrabbit: ParsableCommand {
         The block map draws on the alternate screen, so the scrollback behind it is untouched and every \
         line it showed is written out to stderr when it closes. A run watched on the map therefore \
         leaves behind the same transcript as one run with --plain. A completed run holds the finished \
-        map on screen until a key is pressed; --plain exits as soon as it is done.
+        map on screen until a key is pressed, unless told not to by --no-pause; --plain exits as soon \
+        as it is done.
         """))
     var plain = false
 
@@ -110,6 +111,18 @@ struct Fatrabbit: ParsableCommand {
                   + "which proves every cluster the plan wants to move can actually be read. The "
                   + "volume still has to be unmounted, as above."))
     var dryRun = false
+
+    // The name is the negative because the behaviour it turns off is the default, and `inversion:`
+    // was not used for it: that would add a `--pause` nobody needs alongside the `--no-pause`
+    // everybody asking for this wants, to say the thing that happens anyway.
+    @Flag(help: ArgumentHelp(
+        "Do not hold the finished block map on screen waiting for a key.",
+        discussion: "The map otherwise stays up when a run completes, so its last state can be "
+            + "looked at, which is no use to a run nobody is watching: a scheduled or scripted one "
+            + "would wait for a key that is never coming. Affects nothing else — the transcript "
+            + "written out on the way out is the same either way, and --plain already exits as soon "
+            + "as it is done. A run stopped by Ctrl-C or an error has never paused."))
+    var noPause = false
 
     @Flag(name: .shortAndLong, help: "Emit per-object and per-cluster relocation detail.")
     var verbose = false
@@ -138,7 +151,7 @@ extension Fatrabbit {
         guard !plain, !verbose, Display.isAvailable else {
             return LineConsumer.toStandardError(verbose: verbose)
         }
-        return Display(verbose: verbose)
+        return Display(verbose: verbose, holdsWhenDone: !noPause)
     }
 }
 

@@ -133,7 +133,12 @@ final class Display: EventConsumer, @unchecked Sendable {
     /// instance cannot be captured before it exists.
     private var lines: LineConsumer!
 
-    init(verbose: Bool) {
+    /// Whether a run that finished should hold its last frame on screen rather than tearing straight
+    /// down. False under `--no-pause`, which is the whole of what that flag does.
+    private let holdsWhenDone: Bool
+
+    init(verbose: Bool, holdsWhenDone: Bool) {
+        self.holdsWhenDone = holdsWhenDone
         self.state = Mutex(State(frame: Frame(unicode: Terminal.usesUnicode,
                                               started: .now,
                                               size: Terminal.size()
@@ -168,7 +173,13 @@ final class Display: EventConsumer, @unchecked Sendable {
         // The map is at its most interesting the moment the run ends, which is also the moment it would
         // otherwise disappear. Only on a run that finished: after a Ctrl-C or an error, someone has
         // already been told what they need to know, and asking them to press a key would be rude.
-        let holdOnScreen = state.withLock { state -> Bool in
+        //
+        // And only when someone is there to press one. A key wait is the one thing on this screen that
+        // cannot be waited out, so a run left to itself under a scheduler or a script would sit on it
+        // for ever; `--no-pause` is how that run says so. Nothing else about the frame changes — the
+        // transcript replayed on the way out already carries the "Done in" line, so what is skipped is
+        // the wait, not the record of it.
+        let holdOnScreen = holdsWhenDone && state.withLock { state -> Bool in
             guard state.begun,
                   case .completed = state.outcome ?? .stopped(untouched: false) else { return false }
             return true

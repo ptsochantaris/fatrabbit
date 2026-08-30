@@ -160,6 +160,7 @@ from it is mounted, the run is refused and told to you in the verb your platform
 | `--deMac` | Strip macOS metadata while defragmenting, and clear the hidden attribute from every `.` and `..` entry |
 | `--fast` | Keep the existing order and never shove one object aside for another, so nothing is copied twice |
 | `--plain` | Report as plain lines rather than drawing the block map |
+| `--no-pause` | Do not hold the finished block map on screen waiting for a key |
 | `--dry-run`, `-n` | Go through the whole run writing nothing; the volume is opened read-only |
 | `--verbose` | Per-object and per-cluster relocation detail |
 | `--help`, `-h` | Show usage |
@@ -186,6 +187,11 @@ The map draws on the alternate screen, so your scrollback is left untouched, and
 is written out to stderr when it closes. A run watched on the map therefore leaves behind exactly the
 same transcript as one run with `--plain`. A completed run holds the finished map on screen until a
 key is pressed; `--plain` exits as soon as it is done.
+
+`--no-pause` drops that wait, for a run nobody is sitting in front of — scheduled, or driven from a
+script — which would otherwise hold a finished map open for a key that is never coming. The
+transcript written out on the way is the same either way. A run stopped by Ctrl-C or by an error has
+never waited: you have already been told what you need to know.
 
 Lines are used instead of the map automatically when the map would not work or would only get in the
 way: redirected output, `--verbose`, a window under 60×20, `NO_COLOR`, or a terminal that says it is
