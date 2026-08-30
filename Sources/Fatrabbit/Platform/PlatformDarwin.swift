@@ -69,23 +69,106 @@ extension System {
     /// we want is already in the registry, and finding it is a walk rather than a question for
     /// `hdiutil`.
     static func imageDevices(backing path: String) -> [String] {
-        var iterator: io_iterator_t = IO_OBJECT_NULL
-        guard IOServiceGetMatchingServices(kIOMainPortDefault,
-                                           IOServiceMatching("IOMedia"),
-                                           &iterator) == KERN_SUCCESS else { return [] }
-        defer { IOObjectRelease(iterator) }
-
         var devices: [String] = []
-        var media = IOIteratorNext(iterator)
-        while media != IO_OBJECT_NULL {
+        forEachMedium { media in
             if let name = registryString(media, "BSD Name"), backingImagePath(of: media) == path {
                 devices.append("/dev/" + name)
             }
-            IOObjectRelease(media)
-            media = IOIteratorNext(iterator)
         }
         // A whole disk's node is a prefix of its slices', so the shortest name is the whole disk.
         return devices.sorted { ($0.count, $0) < ($1.count, $1) }
+    }
+
+    /// Every `IOMedia` object in turn, released as it is done with.
+    ///
+    /// One walk shared by the two callers that need it. Not merely to save the six lines: an
+    /// iteration that leaks an object is a bug that shows up as a device node the kernel will not
+    /// let go of afterwards, and there is now one place where that could be got wrong instead of
+    /// two.
+    private static func forEachMedium(_ body: (io_object_t) -> Void) {
+        var iterator: io_iterator_t = IO_OBJECT_NULL
+        guard IOServiceGetMatchingServices(kIOMainPortDefault,
+                                           IOServiceMatching("IOMedia"),
+                                           &iterator) == KERN_SUCCESS else { return }
+        defer { IOObjectRelease(iterator) }
+
+        var media = IOIteratorNext(iterator)
+        while media != IO_OBJECT_NULL {
+            body(media)
+            IOObjectRelease(media)
+            media = IOIteratorNext(iterator)
+        }
+    }
+
+    // MARK: What is attached
+
+    /// Every medium that could hold a filesystem, with what the registry knows about it.
+    ///
+    /// The filter is one rule: a medium whose content is a partition map is a container, not a
+    /// volume. Its children are the candidates and it is not one itself, so it is dropped and
+    /// everything else — every partition, and every whole disk formatted without a map, which is how
+    /// most cards arrive — is kept and left for the boot-sector probe to judge. `Leaf` looks like the
+    /// property for this and is not: an APFS container is not a leaf either, and a whole disk with a
+    /// filesystem written straight onto it stops being one the moment anything mounts from it.
+    ///
+    /// Attachment is three questions asked in order of how much they settle. An image is decided by
+    /// the `image-path` walk rather than by the interconnect string, which reads "File" for most
+    /// attached images and is missing on some. Otherwise `Removable` or `Ejectable` — both of which
+    /// partition media inherit from their whole disk, so there is nothing to walk — or an
+    /// interconnect location the system itself calls External. Everything left is fixed.
+    static func blockDevices() -> [BlockDevice] {
+        var devices: [BlockDevice] = []
+        forEachMedium { media in
+            guard let name = registryString(media, "BSD Name") else { return }
+            let content = registryString(media, "Content") ?? ""
+            guard !content.hasSuffix("partition_scheme") else { return }
+
+            let attachment: BlockDevice.Attachment
+            if backingImagePath(of: media) != nil {
+                attachment = .image
+            } else if registryFlag(media, "Removable") || registryFlag(media, "Ejectable")
+                || inherited(media, "Protocol Characteristics",
+                             "Physical Interconnect Location") == "External" {
+                attachment = .external
+            } else {
+                attachment = .fixed
+            }
+
+            devices.append(BlockDevice(
+                node: "/dev/" + name,
+                attachment: attachment,
+                bytes: registryCount(media, "Size"),
+                model: inherited(media, "Device Characteristics", "Product Name") ?? ""))
+        }
+        return devices
+    }
+
+    private static func registryFlag(_ object: io_object_t, _ key: String) -> Bool {
+        IORegistryEntryCreateCFProperty(object, key as CFString,
+                                        kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool ?? false
+    }
+
+    private static func registryCount(_ object: io_object_t, _ key: String) -> UInt64 {
+        let value = IORegistryEntryCreateCFProperty(object, key as CFString,
+                                                    kCFAllocatorDefault, 0)?.takeRetainedValue()
+        guard let number = value as? NSNumber else { return 0 }
+        return number.uint64Value
+    }
+
+    /// A string out of a dictionary property that belongs to the hardware rather than to the medium.
+    ///
+    /// Which object holds it is not ours to know: how a device is attached and what it is called are
+    /// declared by whichever driver in the stack knows, several objects above a partition. So the
+    /// search goes up the provider chain — the same direction `backingImagePath` walks by hand, done
+    /// here in one call because there is no per-object decision to make on the way.
+    private static func inherited(_ object: io_object_t, _ dictionary: String,
+                                  _ key: String) -> String? {
+        let options = IOOptionBits(kIORegistryIterateRecursively | kIORegistryIterateParents)
+        guard let found = IORegistryEntrySearchCFProperty(object, kIOServicePlane,
+                                                          dictionary as CFString,
+                                                          kCFAllocatorDefault, options),
+              let characteristics = found as? [String: Any] else { return nil }
+        return characteristics[key] as? String
     }
 
     /// Walks up the provider chain from a media object to the disk-image driver above it, which

@@ -95,7 +95,7 @@ exercising the mount check for real requires a loop device.
 ### What differs between the platforms
 
 Only one file each. The FAT format layer, the planners, the defragmenter and the display are the
-same code everywhere; the platform seam is seven members in
+same code everywhere; the platform seam is eight members in
 [`Platform.swift`](Sources/Fatrabbit/Platform/Platform.swift), implemented once per OS. The
 differences that are real rather than cosmetic:
 
@@ -105,21 +105,42 @@ differences that are real rather than cosmetic:
 | Page cache | bypassed via the raw node | sits underneath, and may defer writes past the point they are reported |
 | Durability barrier | `fsync` + `DKIOCSYNCHRONIZECACHE` | `fsync` alone, which is sufficient here |
 | Image files | attached images, found via the IORegistry | loop devices, found via sysfs |
+| Listing devices | one walk over `IOMedia`, which states outright how each medium is attached | a directory of sysfs files, which does not: internal versus removable is inferred |
 | Unmounting | `diskutil unmount` | `umount` |
 
 ## Usage
 
 ```
-fatrabbit <volume> [options]
+fatrabbit [<volume>] [options]
 ```
 
 `<volume>` is an **unmounted** FAT device node or an image file. Which variant it is follows from the
 volume's own cluster count and is worked out on opening — there is no flag for it.
 
+Leave it out and fatrabbit lists what is attached and asks:
+
+```
+Attached FAT volumes:
+
+   1  /dev/disk4s1  FAT32   29.8 GiB  "CAMERA"    SanDisk Extreme
+   -  /dev/disk6s1  FAT16    1.9 GiB  "SHOOT2"    mounted
+        at /Volumes/SHOOT2 — unmount it first, keeping it attached: diskutil unmount /dev/disk6s1
+   2  /dev/disk8    FAT12    1.4 MiB  "BOOTDISK"  Disk Image
+
+  Internal and system disks are not shown. --all-devices includes them.
+
+Pick a volume [1-2, q to abort]:
+```
+
+The list is shown and the question asked even when only one volume was found: a run only ever starts
+unprompted on a device named on the command line. Whether a device is eligible is decided by reading
+its boot sector, not by asking the OS what it thinks the partition holds — a partition type byte is a
+label somebody wrote once, and the volume itself is the only witness worth having.
+
 ### macOS
 
 ```sh
-diskutil list                                  # find the volume
+sudo fatrabbit                                 # list what is attached and pick one
 diskutil unmount /dev/disk4s1                  # unmount, but leave the disk attached
 sudo fatrabbit /dev/disk4s1 --dry-run          # see what would happen
 sudo fatrabbit /dev/disk4s1                    # do it
@@ -132,11 +153,16 @@ happens.
 ### Linux
 
 ```sh
-lsblk                                          # find the volume
+sudo fatrabbit                                 # list what is attached and pick one
 sudo umount /dev/sdb1                          # unmount, but leave the device attached
 sudo fatrabbit /dev/sdb1 --dry-run             # see what would happen
 sudo fatrabbit /dev/sdb1                       # do it
 ```
+
+Which devices count as removable is the one thing Linux states less precisely than macOS: there is no
+property that says whether a disk is internal, so it is inferred from the `removable` flag, the bus
+the device hangs off, and the naming of MMC cards. `--all-devices` is the answer where that guess
+goes the wrong way.
 
 ### On an image file, with no privileges at all
 
@@ -162,6 +188,7 @@ from it is mounted, the run is refused and told to you in the verb your platform
 | `--plain` | Report as plain lines rather than drawing the block map |
 | `--no-pause` | Do not hold the finished block map on screen waiting for a key |
 | `--dry-run`, `-n` | Go through the whole run writing nothing; the volume is opened read-only |
+| `--all-devices` | Include internal and fixed disks when listing volumes to pick from |
 | `--verbose` | Per-object and per-cluster relocation detail |
 | `--help`, `-h` | Show usage |
 
@@ -176,6 +203,12 @@ much less work for nearly the same result.
 
 `--dry-run` still *reads* every source cluster the plan wants to move, which proves the data is
 actually readable before a real run relies on it. The volume still has to be unmounted.
+
+`--all-devices` affects the list only, never what a named device is allowed to be. Only removable,
+external and image-backed media are listed otherwise, and not out of squeamishness: a machine that
+boots UEFI — an Intel Mac, or most Linux hardware — keeps a FAT32 EFI system partition on the disk it
+boots from. It is eligible in every technical sense and it is the last thing anybody reaching for
+this tool meant.
 
 ## Output
 

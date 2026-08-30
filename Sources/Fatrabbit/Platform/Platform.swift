@@ -2,7 +2,7 @@ import Foundation
 
 /// Everything fatrabbit needs from the operating system that the operating systems disagree about.
 ///
-/// The whole of the platform surface is the seven members declared below, each implemented once per
+/// The whole of the platform surface is the eight members declared below, each implemented once per
 /// platform in a file of its own. Nothing else in the codebase carries an `#if`: the FAT format
 /// layer, the planners, the defragmenter and the display are the same code everywhere, which is
 /// most of the reason this seam is worth having as a seam rather than as conditionals in place.
@@ -12,6 +12,20 @@ import Foundation
 ///
 /// **Which volumes are mounted.** `mountedFilesystems` is `getfsstat` against
 /// `/proc/self/mountinfo`. A rename, essentially.
+///
+/// **What is attached at all.** `blockDevices` is the newest member and the one where the two are
+/// least alike. Darwin keeps a registry that knows every medium, how it is attached and what
+/// hardware is behind it, so the answer is one walk over `IOMedia` and three property lookups, and
+/// "is this disk internal" is a fact the system states outright. Linux publishes most of the same
+/// facts as a directory of files, but not that one: nothing in sysfs says whether a device is
+/// internal, so removability there is inferred from a `removable` flag, the bus the device hangs
+/// off, and the naming of MMC cards. That difference is not papered over — it is why `--all-devices`
+/// exists, and the Linux implementation says as much where it guesses.
+///
+/// Note what is deliberately *not* part of this member: whether a device holds a filesystem this
+/// tool can work on. Both platforms will happily offer an opinion — a partition type byte, a content
+/// GUID — and both opinions are labels somebody wrote once. `DeviceScan` reads the boot sector
+/// instead, through the same `BPB` the run uses, so it is one answer arrived at one way on both.
 ///
 /// **Whether a mounted device would be damaged by writing to ours.** `claims` is where the two
 /// part company. Darwin folds `/dev/rdisk4s1` onto `/dev/disk4s1` and knows that a slice of

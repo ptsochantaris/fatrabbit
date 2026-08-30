@@ -32,6 +32,10 @@ struct Fatrabbit: ParsableCommand {
         attached — \(System.unmountCommand(for: System.exampleWholeDevice)) — and note that a disk \
         device only opens as root, so this needs sudo.
 
+        Run with no volume named, every attached FAT volume is listed and one is asked for. The list is \
+        shown and the question asked even when only one was found: a run only ever starts unprompted on \
+        a device named on the command line.
+
         Ctrl-C stops after the batch in flight, which leaves a consistent, partly defragmented volume \
         that a later run carries on from. Press it twice to stop immediately: the design survives that \
         — it is what a power cut does — but the volume is left flagged as modified until the next run.
@@ -39,7 +43,8 @@ struct Fatrabbit: ParsableCommand {
     )
 
     @Argument(help: ArgumentHelp(
-        "Unmounted FAT device node (e.g. \(System.exampleDevice)) or image file.",
+        "Unmounted FAT device node (e.g. \(System.exampleDevice)) or image file. Left out, the "
+            + "attached FAT volumes are listed and one is asked for.",
         discussion: """
         Which variant it is follows from the volume's own cluster count and is worked out on opening; \
         exFAT is a different filesystem and is not supported. On FAT12 and FAT16 the root directory \
@@ -49,7 +54,7 @@ struct Fatrabbit: ParsableCommand {
         \(System.nodeAdvice)
         """,
         valueName: "volume"))
-    var volumePath: String
+    var volumePath: String?
 
     // Comma-separated and repeatable, both of which the old parser also allowed. The raw values are
     // kept as given and split below rather than through a `transform:`, because a transform runs per
@@ -124,6 +129,19 @@ struct Fatrabbit: ParsableCommand {
             + "as it is done. A run stopped by Ctrl-C or an error has never paused."))
     var noPause = false
 
+    // Named for what it does to the list rather than for the media it lets in, because there is no
+    // one word for "internal, fixed, and the one the machine booted from" that also stays true on
+    // both platforms.
+    @Flag(name: .customLong("all-devices"), help: ArgumentHelp(
+        "Include internal and fixed disks when listing volumes to pick from.",
+        discussion: "Only removable, external and image-backed media are listed otherwise. That is "
+            + "not squeamishness: a machine that boots UEFI keeps its EFI system partition on the "
+            + "disk it boots from, formatted FAT32, and that partition is eligible in every "
+            + "technical sense while being the last thing anybody reaching for this tool meant. "
+            + "Affects the list only — a device named on the command line was always accepted "
+            + "whatever it is attached to."))
+    var allDevices = false
+
     @Flag(name: .shortAndLong, help: "Emit per-object and per-cluster relocation detail.")
     var verbose = false
 
@@ -141,6 +159,16 @@ struct Fatrabbit: ParsableCommand {
 // MARK: - Setting up
 
 extension Fatrabbit {
+    /// Which volume to work on, or nil where the answer was to do nothing.
+    ///
+    /// The argument is the answer wherever it was given, and no scan happens at all in that case:
+    /// enumerating devices to confirm a path the caller typed would be work done to second-guess
+    /// them, and would make a run fail on a device the scan happened not to recognise.
+    func resolvedVolume() throws(DevicePicker.Unresolved) -> String? {
+        if let volumePath { return volumePath }
+        return try DevicePicker.choose(includingFixed: allDevices)
+    }
+
     /// Which reading of the run to show.
     ///
     /// The map is used where it will work and skipped otherwise, which is the only decision made here —
@@ -160,10 +188,11 @@ extension Fatrabbit {
 extension Fatrabbit {
     /// Everything between opening the volume and putting it back in order. Returns whether it stopped
     /// early because a stop was asked for.
-    func defragment(report: Reporter) throws(FATError) -> Bool {
-        // `volumePath` rather than `volume`, because the opened volume below wants that name and a
-        // local cannot shadow a property it is used alongside. The help still says `<volume>`.
-        let requested = volumePath
+    ///
+    /// The volume arrives as a parameter rather than being read off `volumePath`, because by here it
+    /// has been settled: either it was given on the command line or it was picked from a list, and
+    /// nothing below has any business knowing which.
+    func defragment(report: Reporter, volume requested: String) throws(FATError) -> Bool {
         let source = System.rawNode(for: requested)
 
         // The one hazard the copy-then-repoint design cannot cover: a mounted volume has the system
@@ -248,6 +277,12 @@ extension Fatrabbit {
     /// is also why the non-zero status is thrown as an `ExitCode` at the very end rather than anywhere
     /// nearer to where it was decided.
     func run() throws {
+        // Before anything else, and before any of the machinery below exists. The picker writes to
+        // stderr and reads stdin, so it has to be finished with the terminal before a consumer takes
+        // the alternate screen — and it runs before `Interruption` is armed on purpose: at this point
+        // nothing is open and nothing has been written, so Ctrl-C being fatal is the right ending.
+        guard let volume = try resolvedVolume() else { throw ExitCode.success }
+
         // Monotonic, so the total is unaffected by the clock being adjusted under a run that may last
         // hours, and continuous rather than suspending, so time asleep counts as the wait it was.
         let started = ContinuousClock.now
@@ -271,7 +306,7 @@ extension Fatrabbit {
         // `localizedDescription` nothing here produces — is not merely unused but impossible to reach.
         var status: Int32 = 0
         do {
-            let interrupted = try defragment(report: report)
+            let interrupted = try defragment(report: report, volume: volume)
             let elapsed = started.duration(to: .now)
             if interrupted {
                 report.post(.ended(.stopped(untouched: false), elapsed: elapsed))

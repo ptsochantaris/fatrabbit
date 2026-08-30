@@ -136,6 +136,111 @@ extension System {
         return devices.sorted { ($0.count, $0) < ($1.count, $1) }
     }
 
+    // MARK: What is attached
+
+    /// Every medium that could hold a filesystem, with what sysfs knows about it.
+    ///
+    /// The same two rules as the Darwin implementation, reached differently. A whole disk that has
+    /// been carved up is a container and its partitions are the candidates, so it is dropped — asked
+    /// as "does anything here call me its parent" rather than by reading a partition table, which is
+    /// the question sysfs can answer. A whole disk with no partitions is kept, because that is how
+    /// most cards are formatted and the filesystem is right there at sector zero.
+    ///
+    /// Pseudo devices are skipped by name, which is the one place a name is the only witness
+    /// available: `zram0` is a compressed swap device and `dm-0` a mapper target, and neither is
+    /// something this tool should offer to defragment. Loop devices are kept only when they are
+    /// reading through a file, which is the same test `imageDevices` makes.
+    ///
+    /// Where this is weaker than Darwin, and knowingly: there is no property that says whether a
+    /// device is internal. `removable` covers USB sticks and card readers but reads 0 for the SD
+    /// cards this tool is most often pointed at, so the bus is consulted as well, and MMC devices are
+    /// taken as removable on the strength of what they are. It is a heuristic, it will occasionally
+    /// put an external disk in the wrong group, and `--all-devices` is the answer to that rather than
+    /// a longer list of special cases here.
+    static func blockDevices() -> [BlockDevice] {
+        guard let names = try? FileManager.default
+            .contentsOfDirectory(atPath: "/sys/class/block") else { return [] }
+
+        var devices: [BlockDevice] = []
+        for name in names {
+            guard !isPseudo(name) else { continue }
+
+            // A partition carries almost nothing of its own: the model, the removable flag and the
+            // file behind a loop device all belong to the disk, so the parent is established first
+            // and everything below asks `disk` rather than `name`. Getting this the other way round
+            // is what dropped `loop1p1` — a partition has no `loop/` directory, so a loop device's
+            // one partition looked exactly like an unused loop slot.
+            let parent = wholeDisk(ofPartition: name)
+            let disk = parent ?? name
+            let backing = sysfsText("\(disk)/loop/backing_file")
+
+            // Every loop slot the kernel has ever handed out stays in here afterwards with nothing
+            // behind it. There are usually eight of them and they are not devices in any sense.
+            if disk.hasPrefix("loop"), backing == nil { continue }
+            // A whole disk with partitions is a container; its partitions are already in `names`.
+            if parent == nil, names.contains(where: { wholeDisk(ofPartition: $0) == name }) {
+                continue
+            }
+
+            // Sector counts in sysfs are always in units of 512 bytes, whatever the device's own
+            // block size — the one number in here that does not mean what its name suggests.
+            let sectors = UInt64(sysfsText("\(name)/size") ?? "") ?? 0
+
+            let attachment: BlockDevice.Attachment
+            if backing != nil {
+                attachment = .image
+            } else if sysfsText("\(disk)/removable") == "1" || isRemovableBus(disk) {
+                attachment = .external
+            } else {
+                attachment = .fixed
+            }
+
+            devices.append(BlockDevice(node: "/dev/" + name,
+                                       attachment: attachment,
+                                       bytes: sectors * 512,
+                                       model: model(of: disk)))
+        }
+        return devices
+    }
+
+    /// Devices that are not media in any sense this tool means: memory-backed disks (`ram`, `zram`),
+    /// mapper targets (`dm-`), software RAID sets (`md`), optical drives (`sr`) and network block
+    /// devices (`nbd`). Each can be named on the command line if somebody really means it; none
+    /// belongs in a list of cards to defragment.
+    ///
+    /// `fd` is deliberately absent. A floppy drive is the one thing here that genuinely is removable
+    /// media holding FAT12, which is a variant this tool went to some trouble to support, so it would
+    /// be a strange thing to hide.
+    private static func isPseudo(_ name: String) -> Bool {
+        ["ram", "zram", "dm-", "md", "sr", "nbd"].contains { name.hasPrefix($0) }
+    }
+
+    /// Whether the disk hangs off a bus that only carries removable media in practice.
+    ///
+    /// The sysfs entry for a block device is a symlink into the device tree, so the bus it is
+    /// attached through is written into its resolved path — the same property `wholeDisk` relies on
+    /// to find a partition's parent, read for a different purpose.
+    private static func isRemovableBus(_ disk: String) -> Bool {
+        if disk.hasPrefix("mmcblk") { return true }   // an SD or MMC card, which reports removable=0
+        let resolved = URL(fileURLWithPath: "/sys/class/block/\(disk)").resolvingSymlinksInPath().path
+        return resolved.contains("/usb")
+    }
+
+    /// What the hardware calls itself. SCSI and USB disks publish `model`; MMC cards publish `name`,
+    /// and neither has the other, so both are tried.
+    private static func model(of disk: String) -> String {
+        sysfsText("\(disk)/device/model") ?? sysfsText("\(disk)/device/name") ?? ""
+    }
+
+    /// A sysfs attribute as a trimmed string, or nil where there is no such file. Everything in here
+    /// is a short text file with a trailing newline, so there is nothing else to parsing it.
+    private static func sysfsText(_ path: String) -> String? {
+        guard let raw = try? String(contentsOfFile: "/sys/class/block/\(path)", encoding: .utf8)
+        else { return nil }
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
     // MARK: What to tell the user to type
 
     /// `losetup -d`, not `hdiutil detach`. A loop device is what Linux offers in place of an

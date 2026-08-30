@@ -1254,7 +1254,7 @@ final class FATVolume {
 
     /// Establishes what the device will accept. A raw node backed by 4096-byte blocks refuses
     /// a 512-byte read outright, so the smaller size is simply tried first.
-    private static func probeBlockSize(_ descriptor: Int32) -> Int {
+    static func probeBlockSize(_ descriptor: Int32) -> Int {
         for candidate in [512, 4096] {
             var probe = [UInt8](repeating: 0, count: candidate)
             let got = probe.withUnsafeMutableBytes {
@@ -1267,10 +1267,15 @@ final class FATVolume {
 
     /// Reads `count` bytes at `offset` by widening to block boundaries and slicing the result.
     ///
-    /// Only for `init`, which runs before there is a `self` to cache into. Everything after it goes
-    /// through `deviceRead`.
-    private static func read(_ descriptor: Int32, blockSize: Int,
-                             at offset: UInt64, count: Int) throws(FATError) -> [UInt8] {
+    /// For the two readers that have no volume to read through. `init` is one, running before there
+    /// is a `self` to cache into; `DeviceScan` is the other, which wants a boot sector off a device
+    /// it has not decided is a volume at all. Everything after `init` goes through `deviceRead`.
+    ///
+    /// The widening is the reason this is shared rather than reimplemented: a raw node with 4096-byte
+    /// blocks refuses a 512-byte read, and a probe that got that wrong would report every card with
+    /// large sectors as not being FAT.
+    static func read(_ descriptor: Int32, blockSize: Int,
+                     at offset: UInt64, count: Int) throws(FATError) -> [UInt8] {
         let block = UInt64(blockSize)
         let start = (offset / block) * block
         let end = ((offset + UInt64(count) + block - 1) / block) * block
