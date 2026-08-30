@@ -11,8 +11,7 @@ import Foundation
 /// in a boot record is wrong. `DeviceScan` settles that question by reading the boot sector through
 /// the same code `FATVolume` uses, so a list and the run that follows it cannot disagree.
 struct BlockDevice {
-    /// How the device is attached, which is the whole of what decides whether it is offered by
-    /// default.
+    /// How the device is attached, which is most of what decides whether it is offered by default.
     enum Attachment {
         /// Removable or external media: a card, a stick, an enclosure. What this tool is for.
         case external
@@ -20,8 +19,8 @@ struct BlockDevice {
         /// Linux. Also what this tool is for, since that is how it is tested.
         case image
         /// Fixed media: the disk the machine boots from, or one bolted inside it. Not offered
-        /// unless asked for, because every Mac's internal disk carries a FAT32 EFI system partition
-        /// and nobody reaching for this tool means that one.
+        /// unless asked for, because a machine that boots UEFI keeps a FAT32 system partition on
+        /// the disk it boots from and nobody reaching for this tool means that one.
         case fixed
     }
 
@@ -35,6 +34,16 @@ struct BlockDevice {
     /// A human-facing name for the hardware, empty where the OS offers none. The point of it is
     /// recognition: "SanDisk Extreme" identifies a card in a way `/dev/disk6s1` does not.
     let model: String
+    /// Whether the partition table hands this partition to the machine's firmware rather than to
+    /// anybody using the machine. An EFI system partition, in practice, and it is formatted FAT32.
+    ///
+    /// Note that this is a partition *type*, which the paragraph above dismisses as evidence — and
+    /// the distinction is the point rather than an inconsistency. A type of `DOS_FAT_32` is a claim
+    /// about a volume's contents, which only the volume can settle, and it is routinely stale. The
+    /// EFI type GUID is not a claim about contents at all: it is the partition table stating who the
+    /// partition is *for*, and that is the whole of the question being asked here. Whether it happens
+    /// to hold FAT is still decided by reading it, like everything else.
+    let firmwareReserved: Bool
 }
 
 // MARK: - What the volume says
@@ -78,14 +87,20 @@ enum DeviceScan {
         let unreadable: Int
     }
 
-    static func sweep(includingFixed: Bool) -> Findings {
+    /// - Parameter unfiltered: List everything, rather than only what somebody plausibly meant.
+    ///   Where this is false, fixed media and firmware-reserved partitions are not merely hidden from
+    ///   the list but never opened, which is the point: an EFI system partition should not be read at
+    ///   all on the way to not offering it.
+    static func sweep(unfiltered: Bool) -> Findings {
         var candidates: [FATCandidate] = []
         var unreadable = 0
 
         for device in System.blockDevices() {
             // A card reader with no card in it. Nothing to read, and on Linux the open can block.
             guard device.bytes > 0 else { continue }
-            guard includingFixed || device.attachment != .fixed else { continue }
+            guard unfiltered || (device.attachment != .fixed && !device.firmwareReserved) else {
+                continue
+            }
 
             switch probe(device) {
             case .fat(let candidate): candidates.append(candidate)
@@ -94,23 +109,29 @@ enum DeviceScan {
             }
         }
 
-        // External media first, then images, then whatever was let in by `includingFixed`, and
-        // within each group by name — sorted on length before content, since `disk10s1` sorts before
+        // External media first, then images, then whatever was let in by `unfiltered` — and within
+        // each group by name, sorted on length before content, since `disk10s1` sorts before
         // `disk4s1` any other way.
         let ordered = candidates.sorted {
-            let (left, right) = (rank(of: $0.device.attachment), rank(of: $1.device.attachment))
+            let (left, right) = (rank(of: $0.device), rank(of: $1.device))
             if left != right { return left < right }
             return ($0.device.node.count, $0.device.node) < ($1.device.node.count, $1.device.node)
         }
         return Findings(candidates: ordered, unreadable: unreadable)
     }
 
-    private static func rank(of attachment: BlockDevice.Attachment) -> Int {
-        switch attachment {
+    /// Where a device belongs in the list: what somebody most likely meant, first.
+    ///
+    /// A firmware partition sorts below its own attachment group rather than into the fixed one, so
+    /// an EFI partition on an external enclosure still reads as external — which it is — while
+    /// sitting under the cards on that enclosure rather than above them.
+    private static func rank(of device: BlockDevice) -> Int {
+        let group = switch device.attachment {
         case .external: 0
-        case .image: 1
-        case .fixed: 2
+        case .image: 2
+        case .fixed: 4
         }
+        return group + (device.firmwareReserved ? 1 : 0)
     }
 
     // MARK: The probe

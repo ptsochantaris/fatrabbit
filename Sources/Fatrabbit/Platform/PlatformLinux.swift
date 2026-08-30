@@ -198,7 +198,17 @@ extension System {
             devices.append(BlockDevice(node: "/dev/" + name,
                                        attachment: attachment,
                                        bytes: sectors * 512,
-                                       model: model(of: disk)))
+                                       model: model(of: disk),
+                                       // Always false, and not an oversight. Darwin fills this in
+                                       // from the partition type its scheme driver publishes; sysfs
+                                       // publishes a partition's number, start and size and not its
+                                       // type, so the EFI type GUID is simply not available without
+                                       // parsing the partition table here — which would mean
+                                       // teaching this tool GPT and MBR to hide one row. The case it
+                                       // would catch barely arises: a UEFI machine's system
+                                       // partition lives on the disk it boots from, which is already
+                                       // `.fixed` and already out of the default list.
+                                       firmwareReserved: false))
         }
         return devices
     }

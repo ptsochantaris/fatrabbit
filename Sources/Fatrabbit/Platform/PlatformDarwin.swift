@@ -138,9 +138,32 @@ extension System {
                 node: "/dev/" + name,
                 attachment: attachment,
                 bytes: registryCount(media, "Size"),
-                model: inherited(media, "Device Characteristics", "Product Name") ?? ""))
+                model: inherited(media, "Device Characteristics", "Product Name") ?? "",
+                firmwareReserved: isSystemPartition(content)))
         }
         return devices
+    }
+
+    /// Whether a partition's declared type hands it to the firmware.
+    ///
+    /// Worth filtering rather than leaving to the person reading the list, because an EFI system
+    /// partition is FAT32, is often on external media — every one of the three USB and NVMe
+    /// enclosures this was developed against carries one, so they are not a rare sight in the
+    /// list — and is 200 MB of firmware payload that would be a strange thing to defragment.
+    ///
+    /// Both spellings are needed because the two partition schemes state the same fact differently.
+    /// GPT names types by GUID and `IOGUIDPartitionScheme` passes the GUID through verbatim, so the
+    /// EFI type arrives as the well-known constant below. MBR names them by a byte, and
+    /// `IOFDiskPartitionScheme` renders the ones it has no friendly name for as hex — type 0xEF is
+    /// the EFI system partition there, and has no friendly name.
+    ///
+    /// A partition claimed by the firmware is not *refused* anywhere: naming one on the command line
+    /// works exactly as it always did, and `--all-devices` puts them back in the list. This is about
+    /// what gets offered unasked.
+    private static func isSystemPartition(_ content: String) -> Bool {
+        let efi = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+        return content.caseInsensitiveCompare(efi) == .orderedSame
+            || content.caseInsensitiveCompare("0xEF") == .orderedSame
     }
 
     private static func registryFlag(_ object: io_object_t, _ key: String) -> Bool {

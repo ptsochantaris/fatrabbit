@@ -105,7 +105,7 @@ differences that are real rather than cosmetic:
 | Page cache | bypassed via the raw node | sits underneath, and may defer writes past the point they are reported |
 | Durability barrier | `fsync` + `DKIOCSYNCHRONIZECACHE` | `fsync` alone, which is sufficient here |
 | Image files | attached images, found via the IORegistry | loop devices, found via sysfs |
-| Listing devices | one walk over `IOMedia`, which states outright how each medium is attached | a directory of sysfs files, which does not: internal versus removable is inferred |
+| Listing devices | one walk over `IOMedia`, which states outright how each medium is attached and what type its partition table gave it | a directory of sysfs files, which states neither: removability is inferred, and partition types are not published at all |
 | Unmounting | `diskutil unmount` | `umount` |
 
 ## Usage
@@ -127,7 +127,7 @@ Attached FAT volumes:
         at /Volumes/SHOOT2 — unmount it first, keeping it attached: diskutil unmount /dev/disk6s1
    2  /dev/disk8    FAT12    1.4 MiB  "BOOTDISK"  Disk Image
 
-  Internal and system disks are not shown. --all-devices includes them.
+  Internal disks and EFI system partitions are not shown. --all-devices includes them.
 
 Pick a volume [1-2, q to abort]:
 ```
@@ -136,6 +136,13 @@ The list is shown and the question asked even when only one volume was found: a 
 unprompted on a device named on the command line. Whether a device is eligible is decided by reading
 its boot sector, not by asking the OS what it thinks the partition holds — a partition type byte is a
 label somebody wrote once, and the volume itself is the only witness worth having.
+
+The one type that *is* believed is the EFI system partition's, and the difference is worth stating.
+`DOS_FAT_32` is a claim about what a volume contains, which only the volume can settle. The EFI type
+GUID is not about contents at all: it is the partition table saying who the partition is *for*, which
+is exactly the question being asked when deciding what to offer. Those partitions are FAT32, they
+appear on external enclosures as readily as on a boot disk, and they are left out of the list without
+being read at all.
 
 ### macOS
 
@@ -188,7 +195,7 @@ from it is mounted, the run is refused and told to you in the verb your platform
 | `--plain` | Report as plain lines rather than drawing the block map |
 | `--no-pause` | Do not hold the finished block map on screen waiting for a key |
 | `--dry-run`, `-n` | Go through the whole run writing nothing; the volume is opened read-only |
-| `--all-devices` | Include internal and fixed disks when listing volumes to pick from |
+| `--all-devices` | List every attached FAT volume, holding nothing back |
 | `--verbose` | Per-object and per-cluster relocation detail |
 | `--help`, `-h` | Show usage |
 
@@ -204,11 +211,16 @@ much less work for nearly the same result.
 `--dry-run` still *reads* every source cluster the plan wants to move, which proves the data is
 actually readable before a real run relies on it. The volume still has to be unmounted.
 
-`--all-devices` affects the list only, never what a named device is allowed to be. Only removable,
-external and image-backed media are listed otherwise, and not out of squeamishness: a machine that
-boots UEFI — an Intel Mac, or most Linux hardware — keeps a FAT32 EFI system partition on the disk it
-boots from. It is eligible in every technical sense and it is the last thing anybody reaching for
-this tool meant.
+`--all-devices` affects the list only, never what a named device is allowed to be. Two things are held
+back without it, and neither out of squeamishness. Fixed disks, because a machine that boots UEFI
+keeps a FAT32 system partition on the disk it boots from. And EFI system partitions wherever they
+live, because they turn up on external enclosures too — all three of the USB and NVMe enclosures this
+was developed against carry one, so they are not a rare sight in a list of removable media, and 200 MB
+of firmware payload is the last thing anybody reaching for this tool meant.
+
+Under the flag the list makes no judgement, but it does still say which row is which: internal and EFI
+rows are marked and sorted below the rest, since asking for them back is not the same as wanting to
+pick one blind.
 
 ## Output
 

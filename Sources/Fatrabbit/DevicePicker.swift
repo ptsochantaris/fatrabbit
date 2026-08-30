@@ -22,7 +22,7 @@ enum DevicePicker {
     }
 
     /// The chosen device node, or nil where the answer was to do nothing.
-    static func choose(includingFixed: Bool) throws(Unresolved) -> String? {
+    static func choose(unfiltered: Bool) throws(Unresolved) -> String? {
         // Both ends have to be a terminal: stdin because there has to be somebody to answer, and
         // stderr because the question and the list go there, and asking one that nobody can see is
         // worse than not asking. A scripted run therefore fails exactly as it does today.
@@ -34,13 +34,13 @@ enum DevicePicker {
             """)
         }
 
-        let findings = DeviceScan.sweep(includingFixed: includingFixed)
+        let findings = DeviceScan.sweep(unfiltered: unfiltered)
         let offered = findings.candidates.filter(\.isAvailable)
         guard !offered.isEmpty else {
-            throw Unresolved(description: nothingToOffer(findings, includingFixed: includingFixed))
+            throw Unresolved(description: nothingToOffer(findings, unfiltered: unfiltered))
         }
 
-        Terminal.write(listing(findings, includingFixed: includingFixed))
+        Terminal.write(listing(findings, unfiltered: unfiltered))
 
         let range = offered.count == 1 ? "1" : "1-\(offered.count)"
         while true {
@@ -67,7 +67,7 @@ enum DevicePicker {
     /// on screen are exactly the answers that will be accepted. A mounted volume is shown with a `-`
     /// where its number would be and the reason underneath, in the words the run itself would use if
     /// the volume had been named on the command line.
-    private static func listing(_ findings: DeviceScan.Findings, includingFixed: Bool) -> String {
+    private static func listing(_ findings: DeviceScan.Findings, unfiltered: Bool) -> String {
         let all = findings.candidates
         let nodes = width(of: all.map(\.device.node))
         let sizes = all.map { readableBytes($0.device.bytes) }
@@ -104,8 +104,8 @@ enum DevicePicker {
             footnotes.append("  \(findings.unreadable.counted("other device")) could not be read; "
                 + "a disk device only opens as root, so this needs sudo.")
         }
-        if !includingFixed {
-            footnotes.append("  Internal and system disks are not shown. "
+        if !unfiltered {
+            footnotes.append("  Internal disks and EFI system partitions are not shown. "
                 + "--all-devices includes them.")
         }
         if !footnotes.isEmpty { lines.append(contentsOf: [""] + footnotes) }
@@ -115,15 +115,23 @@ enum DevicePicker {
     }
 
     /// The trailing column: what a person would use to recognise the thing, or why it is not on
-    /// offer. The two never both need saying — a mounted volume's whole story is that it is mounted.
+    /// offer. A mounted volume's whole story is that it is mounted, so that answer stands alone.
+    ///
+    /// The marks matter most under `--all-devices`, which is the only way an internal disk or an EFI
+    /// system partition reaches the list at all. Asking for them back is not the same as wanting to
+    /// pick one blind: an unmarked 200 MB FAT32 row is exactly the one somebody would take by mistake.
     private static func note(for candidate: FATCandidate) -> String {
         if case .mounted = candidate.state { return "mounted" }
-        let model = candidate.device.model
-        switch candidate.device.attachment {
-        case .image: return model.isEmpty ? "disk image" : model
-        case .external: return model
-        case .fixed: return model.isEmpty ? "internal" : "\(model) (internal)"
-        }
+
+        var marks: [String] = []
+        if candidate.device.attachment == .fixed { marks.append("internal") }
+        if candidate.device.firmwareReserved { marks.append("EFI system") }
+
+        var model = candidate.device.model
+        if model.isEmpty, candidate.device.attachment == .image { model = "disk image" }
+        if marks.isEmpty { return model }
+        let marked = marks.joined(separator: ", ")
+        return model.isEmpty ? marked : "\(model) (\(marked))"
     }
 
     private static func width(of column: [String]) -> Int {
@@ -140,7 +148,7 @@ enum DevicePicker {
     /// Why the list is empty, and what to do about it. Every reason it could be empty gets a
     /// sentence, because "no volumes found" on its own is indistinguishable from a broken tool.
     private static func nothingToOffer(_ findings: DeviceScan.Findings,
-                                       includingFixed: Bool) -> String {
+                                       unfiltered: Bool) -> String {
         var lines: [String] = []
 
         // Found, but every one of them is in use. This is the common case in practice: a card the
@@ -155,7 +163,7 @@ enum DevicePicker {
                     "A device may also be named directly: fatrabbit \(System.exampleDevice)"]
                     .joined(separator: "\n")
             }
-            lines.append(includingFixed
+            lines.append(unfiltered
                 ? "No FAT volume found on any attached device."
                 : "No FAT volume found on any removable, external or image-backed device.")
         } else {
@@ -172,8 +180,9 @@ enum DevicePicker {
             lines.append("\(findings.unreadable.counted("device")) could not be read; a disk device "
                 + "only opens as root, so this needs sudo.")
         }
-        if !includingFixed {
-            lines.append("Internal and system disks were not looked at; --all-devices includes them.")
+        if !unfiltered {
+            lines.append("Internal disks and EFI system partitions were not looked at; "
+                + "--all-devices includes them.")
         }
         lines.append("A device may also be named directly: fatrabbit \(System.exampleDevice)")
         return lines.joined(separator: "\n")

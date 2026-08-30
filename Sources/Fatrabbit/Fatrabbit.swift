@@ -129,17 +129,17 @@ struct Fatrabbit: ParsableCommand {
             + "as it is done. A run stopped by Ctrl-C or an error has never paused."))
     var noPause = false
 
-    // Named for what it does to the list rather than for the media it lets in, because there is no
-    // one word for "internal, fixed, and the one the machine booted from" that also stays true on
-    // both platforms.
+    // Named for what it does to the list rather than for the media it lets in, because what it lets
+    // in is two unlike things — fixed disks and firmware partitions — with no one word between them.
     @Flag(name: .customLong("all-devices"), help: ArgumentHelp(
-        "Include internal and fixed disks when listing volumes to pick from.",
-        discussion: "Only removable, external and image-backed media are listed otherwise. That is "
-            + "not squeamishness: a machine that boots UEFI keeps its EFI system partition on the "
-            + "disk it boots from, formatted FAT32, and that partition is eligible in every "
-            + "technical sense while being the last thing anybody reaching for this tool meant. "
-            + "Affects the list only — a device named on the command line was always accepted "
-            + "whatever it is attached to."))
+        "List every attached FAT volume, holding nothing back.",
+        discussion: "Only removable, external and image-backed media are listed otherwise, and EFI "
+            + "system partitions are left out of even those: they are FAT32, they turn up on "
+            + "external enclosures as readily as on the disk a machine boots from, and 200 MB of "
+            + "firmware payload is the last thing anybody reaching for this tool meant. Both "
+            + "exclusions are about what gets offered unasked and nothing else — a device named on "
+            + "the command line has always been accepted whatever it is or wherever it lives, and "
+            + "under this flag the list makes no judgement either."))
     var allDevices = false
 
     @Flag(name: .shortAndLong, help: "Emit per-object and per-cluster relocation detail.")
@@ -166,7 +166,7 @@ extension Fatrabbit {
     /// them, and would make a run fail on a device the scan happened not to recognise.
     func resolvedVolume() throws(DevicePicker.Unresolved) -> String? {
         if let volumePath { return volumePath }
-        return try DevicePicker.choose(includingFixed: allDevices)
+        return try DevicePicker.choose(unfiltered: allDevices)
     }
 
     /// Which reading of the run to show.
