@@ -53,6 +53,16 @@ Written in Swift 6, runs on macOS and Linux. One dependency, Apple's
 
 ## Building
 
+On macOS there is a Homebrew tap:
+
+```sh
+brew install ptsochantaris/tap/fatrabbit
+```
+
+That builds from source on your machine — there is no bottle — so it wants the same toolchain the
+table above asks for, and takes about as long as a `make release` would. Everything below is for
+working from a checkout, which is still the only route on Linux.
+
 The same two commands on macOS and on Linux:
 
 ```sh

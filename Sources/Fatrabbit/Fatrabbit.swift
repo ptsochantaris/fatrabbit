@@ -39,7 +39,12 @@ struct Fatrabbit: ParsableCommand {
         Ctrl-C stops after the batch in flight, which leaves a consistent, partly defragmented volume \
         that a later run carries on from. Press it twice to stop immediately: the design survives that \
         — it is what a power cut does — but the volume is left flagged as modified until the next run.
-        """
+        """,
+        // Buys `--version` from the formatter, which is the whole reason it is here: a tool installed
+        // from a tarball rather than built from a checkout has no other way to say which one it is.
+        // This string is the release number written by hand, and the one thing here that has to move
+        // in step with the git tag — Homebrew's own test asserts the two agree.
+        version: "1.0.0"
     )
 
     @Argument(help: ArgumentHelp(
