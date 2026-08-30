@@ -16,7 +16,8 @@ and medical instruments and anything on a card under 2 GB are very largely FAT16
 precisely the primitive readers this tool exists for. FAT12 comes along because it is nearly the same
 code, not because a volume of under 4,085 clusters has much to gain.
 
-Written in Swift 6, runs on macOS and Linux, no dependencies.
+Written in Swift 6, runs on macOS and Linux. One dependency, Apple's
+[swift-argument-parser](https://github.com/apple/swift-argument-parser).
 
 ## What it does
 
@@ -66,20 +67,16 @@ only if the destination needs it. `make install PREFIX=~/.local` lands somewhere
 asks for nothing.
 
 `make release` is the build to ship: `-O` and whole-module from the release configuration,
-`-Ounchecked` from the manifest, and full LTO. That last one is the entire reason this project has a
-Makefile at all — LTO changes which artifacts the build produces and how the link consumes them, so
-the build system has to know about it, which makes it a flag to `swift build` rather than something a
-package manifest can express.
+`-Ounchecked` from the manifest, and full LTO. That last one is why there is a Makefile at all —
+LTO has to be a flag to `swift build` and cannot be expressed in a package manifest. The
+[Makefile](Makefile) says why at length, along with what it is and is not worth.
 
-Be clear about what LTO is worth here, though, because it is not speed. It buys a smaller binary —
-578 KiB against 635 KiB on macOS, 1.59 MiB against 1.75 MiB on Linux — and no measurable difference
-in run time. On a run that is three quarters device I/O there is nothing for it to win.
+`swift build -c release` and opening `Package.swift` in Xcode both work fine, and produce a slightly
+larger binary without the LTO. Good for editing and debugging.
 
-One wrinkle if you build in a container: the official `swift` images do not ship `make`, so
-`apt-get install -y make` first, or use `swift build -c release` and forgo the LTO.
-
-`swift build -c release` and opening `Package.swift` in Xcode both work fine and produce the larger
-non-LTO binary. Good for editing and debugging; worth knowing before quoting a size from one.
+Two wrinkles if you build in a container: the official `swift` images do not ship `make`, so
+`apt-get install -y make` first, or use `swift build -c release` and forgo the LTO. And the first
+build needs network access, to fetch the one dependency.
 
 ### Checking the Linux build from a Mac
 
@@ -199,7 +196,8 @@ dumb.
 | Code | Meaning |
 | --- | --- |
 | 0 | Completed |
-| 1 | Error — bad arguments, not a FAT volume, mounted volume, I/O failure |
+| 1 | Error — not a FAT volume, mounted volume, I/O failure |
+| 64 | Bad arguments (`EX_USAGE`) |
 | 130 | Stopped by Ctrl-C; the volume is consistent and a later run resumes |
 
 ## Safety

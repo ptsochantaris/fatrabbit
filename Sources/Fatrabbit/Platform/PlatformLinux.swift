@@ -150,11 +150,12 @@ extension System {
     /// Linux has no raw node to redirect to, so this says what is true here instead of repeating
     /// Darwin's claim. Understating it deliberately: the page cache genuinely is in the way, and
     /// promising otherwise would be the kind of thing this tool exists not to do.
-    static let nodeAdvice = """
-                             A device node is opened as given; Linux has no separate raw node, so
-                             the kernel's page cache sits underneath and may defer writes past the
-                             point this tool reports them.
-    """
+    ///
+    /// One paragraph on one line, deliberately: the help formatter wraps it to the terminal, so any
+    /// line breaks written in here would survive the wrap and land as breaks in the middle of it.
+    static let nodeAdvice = "A device node is opened as given; Linux has no separate raw node, so "
+        + "the kernel's page cache sits underneath and may defer writes past the point this tool "
+        + "reports them."
 
     // MARK: The device itself
 

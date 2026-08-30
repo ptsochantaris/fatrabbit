@@ -132,11 +132,12 @@ extension System {
 
     /// The help text's paragraph about which node gets opened. Platform-specific in substance and
     /// not merely in spelling, which is why it is here rather than interpolated from parts.
-    static let nodeAdvice = """
-                             Device nodes are always opened raw: /dev/diskN is redirected to
-                             /dev/rdiskN, so the tool talks to the medium itself rather than to
-                             a cache that will decide later when the work really happens.
-    """
+    ///
+    /// One paragraph on one line, deliberately: the help formatter wraps it to the terminal, so any
+    /// line breaks written in here would survive the wrap and land as breaks in the middle of it.
+    static let nodeAdvice = "Device nodes are always opened raw: /dev/diskN is redirected to "
+        + "/dev/rdiskN, so the tool talks to the medium itself rather than to a cache that will "
+        + "decide later when the work really happens."
 
     // MARK: The device itself
 

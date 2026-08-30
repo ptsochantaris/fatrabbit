@@ -2,11 +2,18 @@
 
 import PackageDescription
 
-// fatrabbit is one executable target with no dependencies, no resources and no tests, so almost
+// fatrabbit is one executable target with one dependency, no resources and no tests, so almost
 // everything here is carrying over what the Xcode project used to say. The settings below are the
 // ones that were load-bearing; the rest of what a .pbxproj holds — signing, deployment targets,
 // Info.plist keys, the iOS platforms this command-line tool never built for — described a world
 // this package does not live in.
+//
+// The one dependency is swift-argument-parser, which replaced a hand-rolled `while` over
+// CommandLine.arguments and the wall of help text that had to be kept in step with it by hand. That
+// is the whole reason it is here: the option table and the help output are now the same
+// declarations, so they cannot drift apart. It is Apple's own package, pure Swift, has no
+// dependencies of its own beyond the standard library, and builds on both platforms this tool
+// targets — so the cost is a checkout and a resolved-file, not a new platform risk.
 //
 // The measurement harness under Testing/ is deliberately outside Sources/, so it is not something
 // the target has to exclude. It never located the binary through DerivedData, so nothing there
@@ -40,9 +47,15 @@ let package = Package(
         // reach for keeps the name it had.
         .executable(name: "fatrabbit", targets: ["fatrabbit"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.0")
+    ],
     targets: [
         .executableTarget(
             name: "fatrabbit",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
             swiftSettings: [
                 // SWIFT_VERSION = 6.0. Carries strict concurrency at `complete` with it, so that
                 // does not need saying separately.
