@@ -13,6 +13,11 @@ cache that may still hold what was there before. This reads the bytes.
 Works on a device node or on an image file, including one truncated by dd to just the
 region in use, as long as every file lives inside the part that was copied.
 
+Reads are positioned (`os.pread`), looped until complete, and kept under whatever maximum the
+device advertises. That is not fussiness: the previous one-line reader accepted a short read
+without complaint, which truncated a directory parse and reported a directory of fifty files as
+missing when it was present the whole time. A verifier that under-reports is worse than none.
+
 **This is deliberately a second implementation of the format, and deliberately not in Swift.**
 Its whole value is being independent of the tool it checks: a misunderstanding of FAT that
 fatrabbit and this script shared would pass both, and sharing a language — never mind sharing
@@ -24,6 +29,7 @@ that have nothing to do with the volume: .fseventsd gets a fresh UUID and new lo
 each time, and Spotlight rebuilds its index.
 """
 
+import os
 import sys
 import hashlib
 
@@ -33,9 +39,41 @@ SKIP = ('.fseventsd', '.Spotlight-V100', '.Spotlight-V200', '.Trashes', '.Tempor
 LFN_OFFSETS = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
 
 
+def device_limit(fd):
+    """The largest transfer this device says it will accept, or None where it will not say.
+
+    The same question fatrabbit asks, for the same reason, and this file has to ask it
+    independently or it is not an independent check. A USB card reader measured during
+    development advertises 131,072 bytes and answers a larger request with the right *length* of
+    the wrong bytes; a verifier that exceeded that would report corruption that is not there, or
+    miss corruption that is.
+    """
+    try:
+        import fcntl
+        import struct
+        if sys.platform == 'darwin':
+            # DKIOCGETMAXBYTECOUNTREAD, _IOR('d', 70, uint64_t), written out because it is a macro.
+            request = 0x40000000 | ((8 & 0x1FFF) << 16) | (ord('d') << 8) | 70
+            buf = bytearray(8)
+            fcntl.ioctl(fd, request, buf, True)
+            value = struct.unpack('<Q', bytes(buf))[0]
+        else:
+            # BLKSECTGET, in 512-byte sectors, and a short on older kernels.
+            buf = bytearray(4)
+            fcntl.ioctl(fd, 0x1267, buf, True)
+            value = struct.unpack('<I', bytes(buf))[0] * 512
+        return value or None
+    except Exception:
+        return None
+
+
 class Volume:
     def __init__(self, path):
-        self.f = open(path, 'rb')
+        self.fd = os.open(path, os.O_RDONLY)
+        # A ceiling of a megabyte, lowered to whatever the device asks for. A plain image file
+        # declines to answer and keeps the ceiling.
+        stated = device_limit(self.fd)
+        self.chunk = min(stated, 1 << 20) if stated else 1 << 20
         boot = self.read_at(0, 512)
         self.bps = int.from_bytes(boot[11:13], 'little')
         spc = boot[13]
@@ -93,8 +131,35 @@ class Volume:
         return {12: 0xFF7, 16: 0xFFF7, 32: 0x0FFFFFF7}[self.bits]
 
     def read_at(self, offset, count):
-        self.f.seek(offset)
-        return self.f.read(count)
+        """Exactly `count` bytes at `offset`, or an error saying why not.
+
+        Three things this deliberately does, each of which the previous one-line version did not,
+        and each of which produced a wrong answer on a real card:
+
+        **A short read is not silently accepted.** `file.read(n)` on a raw device may hand back
+        fewer than `n` bytes, and returning that truncated buffer made a directory parse simply
+        stop early — every entry past the truncation point vanished, and the volume looked as
+        though it had lost a directory of fifty files that was in fact there the whole time. A
+        verifier that under-reports files is worse than no verifier.
+
+        **`os.pread` rather than seek-and-read.** A positioned read carries its own offset, so
+        there is no shared file position to be wrong about. A buffered handle seeking around a
+        33 GB device across hundreds of thousands of reads was separately observed returning wrong
+        bytes, which is how a confident report of 1,396 broken directories came to be written about
+        a volume that had none.
+
+        **Requests are kept under what the device accepts.** See `device_limit`.
+        """
+        out = bytearray(count)
+        done = 0
+        while done < count:
+            want = min(self.chunk, count - done)
+            got = os.preadv(self.fd, [memoryview(out)[done:done + want]], offset + done)
+            if not got:
+                raise SystemExit(f'short read at offset {offset}: wanted {count} bytes, '
+                                 f'got {done} before the device stopped answering')
+            done += got
+        return bytes(out)
 
     def chain(self, start):
         out, cluster, seen = [], start, set()

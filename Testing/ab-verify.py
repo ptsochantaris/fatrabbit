@@ -56,11 +56,39 @@ def buffered_node(path):
     return path
 
 
+def device_chunk(fd, ceiling=1 << 22):
+    """The largest transfer to hand this device, which is not ours to choose.
+
+    Both platforms publish a maximum and a USB card reader measured during development advertises
+    131,072 bytes — a thirty-second of the four megabytes this file used to ask for. Exceeding it
+    on that reader returns the right *length* of the wrong bytes, silently, which in a harness whose
+    entire job is deciding whether two volumes agree is the worst possible failure: it would restore
+    a snapshot wrongly, capture a volume wrongly, and then report with confidence.
+    """
+    try:
+        import fcntl
+        import struct
+        if sys.platform == 'darwin':
+            # DKIOCGETMAXBYTECOUNTREAD, _IOR('d', 70, uint64_t).
+            request = 0x40000000 | ((8 & 0x1FFF) << 16) | (ord('d') << 8) | 70
+            buf = bytearray(8)
+            fcntl.ioctl(fd, request, buf, True)
+            value = struct.unpack('<Q', bytes(buf))[0]
+        else:
+            buf = bytearray(4)                          # BLKSECTGET, in 512-byte sectors
+            fcntl.ioctl(fd, 0x1267, buf, True)
+            value = struct.unpack('<I', bytes(buf))[0] * 512
+        return min(value, ceiling) if value else ceiling
+    except Exception:
+        return ceiling
+
+
 def restore(snapshot, device):
     print(f'  restoring {snapshot} -> {device}…', flush=True)
     started = time.time()
     with open(snapshot, 'rb') as source, open(device, 'r+b') as target:
-        while chunk := source.read(1 << 22):
+        step = device_chunk(target.fileno())
+        while chunk := source.read(step):
             target.write(chunk)
         target.flush()
         os.fsync(target.fileno())
@@ -74,9 +102,10 @@ def restore(snapshot, device):
 
 def capture(device, size, path):
     with open(device, 'rb') as source, open(path, 'wb') as target:
+        step = device_chunk(source.fileno())
         left = size
         while left > 0:
-            chunk = source.read(min(1 << 22, left))
+            chunk = source.read(min(step, left))
             if not chunk:
                 break
             target.write(chunk)
