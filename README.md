@@ -208,6 +208,7 @@ from it is mounted, the run is refused and told to you in the verb your platform
 | `--verify-copies` | Check every span against the medium as it is copied, and stop if the medium contradicts itself |
 | `--all-devices` | List every attached FAT volume, holding nothing back |
 | `--verbose` | Per-object and per-cluster relocation detail |
+| `--version` | Show the release number, which a build installed from a tarball has no other way to state |
 | `--help`, `-h` | Show usage |
 
 Names given to `--first` and `--last` match 8.3 short names, case-insensitively.
