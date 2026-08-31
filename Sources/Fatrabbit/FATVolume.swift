@@ -522,6 +522,10 @@ final class FATVolume {
     let rootLocation: RootLocation
     /// Bytes one copy of the table occupies, which is where the next copy begins.
     let fatByteCount: Int
+    /// Largest transfer the device stated it would accept, or nil where it declined to say. Kept
+    /// only to be reported: what the run uses is `FATVolume.maxTransfer`, which this may have
+    /// lowered.
+    let deviceMaxTransfer: Int?
 
     /// The active FAT decoded into one entry per cluster, widened to `UInt32` whatever its on-disk
     /// width, and indexed by cluster number.
@@ -558,6 +562,14 @@ final class FATVolume {
         }
         self.file = OpenDescriptor(opened)
         self.caches = System.isUncached(opened)
+
+        // Asked before the first read, since the boot sector goes out through the same path. A
+        // device that states a smaller limit than the ceiling gets its way; one that says nothing
+        // leaves the ceiling standing.
+        FATVolume.maxTransfer = FATVolume.transferCeiling
+        let stated = System.maximumTransfer(opened)
+        self.deviceMaxTransfer = stated
+        if let stated, stated < FATVolume.maxTransfer { FATVolume.maxTransfer = stated }
 
         let blockSize = FATVolume.probeBlockSize(opened)
         self.blockSize = blockSize
@@ -996,6 +1008,24 @@ final class FATVolume {
         try readBytes(at: offset(ofCluster: cluster), count: clusterSize)
     }
 
+    /// Reads straight from the medium, consulting nothing and remembering nothing.
+    ///
+    /// The one reader that deliberately steps around the cache, and the only kind of read worth
+    /// anything to a verification pass: a check served from memory confirms what this process
+    /// believes it wrote, which is precisely the belief in question. Going to the device is what
+    /// makes the answer evidence rather than an echo.
+    ///
+    /// It does not admit what it finds either. A verification read is a one-off by nature, and
+    /// storing it would let a check populate the cache that a later check then hits.
+    func readUncached(at offset: UInt64, count: Int) throws(FATError) -> [UInt8] {
+        let block = UInt64(blockSize)
+        let start = (offset / block) * block
+        let end = ((offset + UInt64(count) + block - 1) / block) * block
+        let window = try FATVolume.rawRead(descriptor, at: start, count: Int(end - start))
+        let lower = window.startIndex + Int(offset - start)
+        return [UInt8](window[lower ..< lower + count])
+    }
+
     // MARK: Writing
 
     /// Writes `bytes` at `offset`. Sub-block or unaligned writes become a read-modify-write of
@@ -1233,8 +1263,17 @@ final class FATVolume {
         while true {
             if c < 2 || c > countOfClusters + 1 {
                 if c >= flavour.eocThreshold { return result }   // proper end-of-chain
-                if c == 0 { throw FATError.corruption("free cluster inside chain from \(start)") }
-                throw FATError.corruption("invalid cluster \(c) inside chain from \(start)")
+                // Where the very first value is the bad one there is no chain yet and nothing has
+                // been followed, so saying "inside chain from" would describe a walk that never
+                // happened and name the same cluster twice — once masked, once not. That reading
+                // sends whoever is holding the volume looking for a fault partway down a chain when
+                // what is actually wrong is the pointer that named the start.
+                let position = result.isEmpty
+                    ? "as the start of a chain (from a directory entry naming \(start))"
+                    : "at position \(result.count) of a chain from \(start)"
+                if c == 0 { throw FATError.corruption("free cluster \(position)") }
+                throw FATError.corruption("invalid cluster \(c) \(position); "
+                    + "the highest this volume can name is \(countOfClusters + 1)")
             }
             guard visited.insert(c).inserted else {
                 throw FATError.corruption("cluster loop detected in chain from \(start)")
@@ -1250,7 +1289,27 @@ final class FATVolume {
 
     /// Largest single transfer. Raw devices cap how much they will move in one call, and this
     /// is a multiple of every plausible block size.
-    private static let maxTransfer = 1 << 20
+    /// Largest single transfer, which the device is asked for rather than told.
+    ///
+    /// This used to be a hardcoded megabyte, described as "a multiple of every plausible block
+    /// size" — which conflated how a transfer must be *aligned* with how large it may be. Those are
+    /// different limits and devices publish the second one. A USB card reader measured here
+    /// advertises 131,072 bytes through `DKIOCGETMAXBYTECOUNTREAD`, so every megabyte-sized read
+    /// the copy path issued was eight times over a limit the device had already stated. On that
+    /// reader an oversized read returns the right *length* of the wrong bytes — the contents of an
+    /// address 65,536 away — with no error at any level, which is how it came to destroy four
+    /// directories and an unknown amount of file content while reporting success.
+    ///
+    /// An `hdiutil` image on the same machine advertises 2,097,152, comfortably above a megabyte,
+    /// which is exactly why an image could never reproduce any of it and why a card reproduced it
+    /// four times out of four.
+    ///
+    /// A megabyte remains the ceiling for anything that declines to answer — a plain image file has
+    /// no such limit — so this is a clamp rather than a new number: `min(what it says, 1 MiB)`.
+    /// A `var` because it is settled per volume when one is opened, and reset to the ceiling
+    /// first so that opening a second could never inherit the first's answer.
+    nonisolated(unsafe) static var maxTransfer = 1 << 20
+    static let transferCeiling = 1 << 20
 
     /// Establishes what the device will accept. A raw node backed by 4096-byte blocks refuses
     /// a 512-byte read outright, so the smaller size is simply tried first.

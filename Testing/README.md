@@ -5,6 +5,11 @@ order of magnitude faster, overlaps reads with writes, and absorbs small writes 
 so it reports "no difference" for changes worth 13% on real hardware, and "8% slower" for the
 same change. Anything performance-related has to be measured on the medium the tool is for.
 
+And not only performance. An image also accepts transfers a card refuses: 2 MiB against 128 KiB on
+the two measured here, which is enough for an image to run clean while a card silently returns the
+wrong bytes. That cost four directories and an unknown amount of file content before it was found —
+see the section below. An image A/B proves the arithmetic; only hardware proves the transfers.
+
 **Every card figure below is stale.** They all predate the metadata cache, adjacent-transfer fusion and
 the move to `pread`/`pwrite`, each of which changed the shape of a run — so treat the card rows as a
 record of what was true when measured, not as a current comparison.
@@ -22,6 +27,131 @@ around it must too. **The test device is the 320 GB USB 2.0 spinning drive, the 
 they are handed out in attach order and the number this drive had last session belonged to a
 CoreSimulator volume the next. Card figures still appear below as a record, but nothing is being
 measured on one at present.
+
+A third standing rule, added after it cost a volume: **ask the device what it will accept, and never
+assume an image can stand in for a card on anything to do with how bytes reach the medium.** Both
+halves of that are the section immediately below.
+
+## The transfer size has to come from the device, and an image will never tell you
+
+This is the most expensive thing in this file. A run destroyed four directories and an unknown amount
+of file content on a 33 GB card, reported success, and left a volume that passed `fsck` and every
+structural check there is.
+
+`maxTransfer` was a hardcoded megabyte, justified in its own comment as "a multiple of every
+plausible block size" — which quietly conflated two different limits: how a transfer must be
+*aligned*, and how large it may be. Devices publish the second. Nobody had asked.
+
+| Device | Advertised maximum | What was being asked for |
+| --- | --- | --- |
+| USB card reader | **131,072** (128 KiB) | 1 MiB — **8× over** |
+| `hdiutil` raw image | 2,097,152 (2 MiB) | 1 MiB — within limits |
+
+On that reader an oversized read returns the **right length of the wrong bytes** — the contents of an
+address 65,536 away — with no error at any level. `pread` returns the full count. Nothing is logged.
+The copy is then written faithfully to the correct destination, so the FAT, every pointer and every
+length agree and only the contents are wrong.
+
+Every read that came back wrong exceeded the advertised limit, and every one came back from exactly
+64 KiB away:
+
+| Failing read | Multiple of 64 KiB |
+| --- | --- |
+| 176 KB | 2.75 |
+| 448 KB | 7.00 |
+| 512 KB | 8.00 |
+| 4,656 KB | 72.75 |
+
+The fix is to ask: `System.maximumTransfer` is the platform seam's ninth member —
+`DKIOCGETMAXBYTECOUNTREAD` and its write twin on Darwin, `BLKSECTGET` on Linux — and the megabyte
+became `min(what the device says, 1 MiB)`. The ceiling stays for interruptibility and progress
+granularity rather than capability: a 64 MB span as one transfer would freeze the block map for its
+duration, and the syscall saving from raising it is microseconds against transfers measured in
+seconds.
+
+**The methodological lesson, which is the part worth carrying.** An image cannot reproduce this
+class of fault *at all*, because images advertise a larger maximum than any card. The same binary
+with the same flags completed a full run on a card-identical image — 387,817 verified moves, 1.14M
+clusters, not a murmur — while the card failed four times out of four. Every image A/B in this file
+is silent on anything that depends on how large a request the medium is given. `ab-verify.py` on an
+image proves the *arithmetic*; only hardware proves the *transfers*.
+
+What was measured and ruled out along the way, so nobody repeats it:
+
+- **Not the media, and not read instability.** Two full passes over all 33.5 GB, every 8 MB block
+  hashed: 4,000 blocks compared, zero differing. 67 GB of reads. Reads alone are stable — it takes
+  writes to provoke.
+- **Not the write/read turn.** A durability barrier inserted at exactly the turn from a write pass
+  back to a read pass, which is where the budget-triggered flushes had nothing between them: the run
+  failed identically, same −65,536 signature. A sync is stronger than a wait, so the wait was never
+  going to be the answer either. The flag that did this was measured and then removed.
+- **Not the cache.** One failure had the cache holding all 352 blocks of the range and agreeing with
+  the medium, while a direct read disagreed. Another had the cache holding none of it.
+- **Not the kernel.** No USB or storage error appears in the system log for any of the four runs.
+
+### Verified on both platforms
+
+| Gate | Result |
+| --- | --- |
+| Card, transfers capped at 64 KiB, full run with `--verify-copies` | all 6,429 generations, 368,255 objects, 1,761,461 clusters, 433,953 transfers, **zero read contradictions**, 0 fragmented, `fsck_msdos` clean |
+| Card, same volume, 1 MiB transfers | failed 4/4, always inside the first gigabyte |
+| Card, auto-detection, no flags | reports and uses 128 KiB |
+| Linux loop device, `max_sectors_kb` = 1280 / 128 / 64 | honours each exactly; silent at 1280, which is above the ceiling |
+| Linux, `--verify-copies` at 128 KiB | 3,724 objects moved, contents byte-identical through `fatread.py`, 0 fragmented, `fsck.fat` clean |
+
+The Linux path is tested by lowering the kernel's own advertised maximum —
+`echo 128 > /sys/block/loopN/queue/max_sectors_kb` in a `--privileged` container — which is the only
+way to exercise the clamp without hardware that misbehaves.
+
+### The harness had the same bug, and so does `dd`
+
+Worth its own heading, because a verifier that is wrong in the same way as the tool it verifies is
+worse than no verifier — it manufactures confidence.
+
+`fatread.py` reached the volume through a buffered handle and, fatally, accepted a **short read
+without complaint**:
+
+```python
+def read_at(self, offset, count):
+    self.f.seek(offset)
+    return self.f.read(count)          # may return fewer bytes. Silently.
+```
+
+A truncated cluster buffer makes the directory parse stop early, so every entry past the truncation
+point vanishes. On the card that hid a directory of fifty files — `Eldritch Force/DATA/ROOMART` —
+which was present the whole time. It also asked for the entire FAT in one 8 MB request, sixty-four
+times what the card accepts. Repaired: positioned reads, looped until complete, capped at the
+device's stated maximum, and a hard error rather than a short buffer. The file count on the same
+unchanged card went from 272,960 to **273,096**.
+
+`ab-verify.py` was restoring and capturing in 4 MB chunks — thirty-two times over. Both now ask the
+device.
+
+And **`dd bs=1m` is not safe on such a device either.** Writing an 18.7 GB image to this card at 1 MB
+per block left exactly one file of 59,872 bytes holding entirely foreign content — 57,629 bytes
+different, from byte 0 — where the source image had it correct. Every fatrabbit run on that card had
+`--verify-copies` on and reported no read contradiction, so the substitution predates them: the
+imaging step did it. One bad block in 17,900. Use `bs=128k` on a card, or whatever it advertises.
+
+The general lesson is uncomfortable and worth stating plainly: **every tool in this directory that
+touches a device is a suspect until it has been shown to respect the device's limits.** Three of them
+did not.
+
+### What it leaves behind, all default-on and free
+
+The dot-entry pass now refuses to write a `.` into a cluster that holds no directory, instead of
+taking arbitrary bytes for a directory and patching a pointer into them. That is not hypothetical:
+all four destroyed directories carried, at bytes 20 and 26 — exactly the FAT pointer field — that
+cluster's own number, under name fields reading `SINCLAIR`, `ZXTape!` and `Navy1`. Those eight bytes
+were the repair pass's own handwriting, papering over the loss.
+
+`CopyBatch` treats a missing or wrong-length span as a hard failure rather than skipping it, and the
+chain walker distinguishes a bad start cluster from a bad step instead of printing one number twice
+once masked and once not.
+
+`--verify-copies` is the one flag kept: it reads every span twice, by two routes, and stops if the
+medium contradicts itself. Off by default, since it doubles the read traffic of the copy phase, and
+for a medium you have reason to distrust.
 
 ## Adding FAT16 and FAT12
 
@@ -393,6 +523,11 @@ On a device rather than an image, which is the whole point. The one real corrupt
 has seen did not reproduce on an image: identical input, identical plan, identical transfer log for
 the first fifteen thousand transfers, clean as a file and wrong on a card. An image A/B would have
 passed it. If a change touches how bytes reach the medium, the medium has to be in the loop.
+
+There is now a mechanism to go with that observation, and it is worse than "an image is faster": an
+image *accepts requests a card refuses*, 2 MiB against 128 KiB, so an oversized transfer is legal on
+one and silently wrong on the other. No amount of A/B-ing against an image can see that, because
+neither side of the comparison provokes it. See the transfer-size section at the top.
 
 Two builds are needed rather than one, because a build that is wrong the same way every time
 verifies perfectly against itself. Pointed at the merged build and its replacement it reports:
@@ -1363,6 +1498,25 @@ The lesson to carry: the fault was never shown to be the *path's*, only to have 
 clean run proves very little on its own. Anything touching how bytes reach the medium goes through
 `ab-verify.py` on hardware before it is believed. The signature to watch for is writes that never
 landed, in small regions, repeatably, with reads afterwards stably returning the wrong bytes.
+
+**Since resolved, probably.** The transfer-limit fault at the top of this file is very likely the
+same thing, and the reasons to think so are the ones listed above as exonerations:
+
+- *"The divergence begins at a read, which returns different bytes on the card than the same read of
+  the same offset in the same state on a file."* That is the fault exactly. An image advertises a
+  larger maximum than a card, so the same oversized read is legal on one and not the other.
+- *"Not the transfer size."* That test asked whether large transfers **complete** — single writes up
+  to 4 MB, 256 MB of sustained 1 MB writes — and they do. Completing is not the same as returning
+  correct data, and no test here asked the device what size it would accept.
+- *"It vanishes under observation … a build that reads everything twice is clean."* Reading twice is
+  what `--verify-copies` does, and it is how the fault was eventually caught rather than avoided.
+- *"The merging has since been removed, and with it gone: 0 wrong blocks where there were 541."*
+  Merging made transfers **larger**. Removing it brought them back under the limit.
+
+Not proven — that was a different card, and nothing was kept from it. But the correlation runs the
+right way in every particular, and the one measurement nobody took was the cheap one: a single ioctl
+asking what the device would accept. Which is now taken on every run, and reported when the answer
+is smaller than the ceiling.
 
 ## Getting write access to a device
 

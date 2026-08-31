@@ -136,6 +136,14 @@ enum RunEvent: Sendable {
         /// FAT32 user never meets: a root formatted for 512 names cannot hold a 513th, whatever
         /// space is free.
         let fixedRootEntries: Int?
+        /// Largest transfer the device said it would accept, and nil where it declined to say — a
+        /// plain image file has no such limit. Reported because it is the one piece of geometry here
+        /// that the medium states rather than the filesystem, and because a device asking for
+        /// something unusually small is worth a reader knowing about: it used to be guessed, and the
+        /// guess cost data.
+        let deviceMaxTransfer: Int?
+        /// What the run will actually use: the smaller of the above and this tool's own ceiling.
+        let transferSize: Int
 
         var byteCount: UInt64 { UInt64(clusterCount) * UInt64(clusterSize) }
     }

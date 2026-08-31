@@ -205,6 +205,7 @@ from it is mounted, the run is refused and told to you in the verb your platform
 | `--plain` | Report as plain lines rather than drawing the block map |
 | `--no-pause` | Do not hold the finished block map on screen waiting for a key |
 | `--dry-run`, `-n` | Go through the whole run writing nothing; the volume is opened read-only |
+| `--verify-copies` | Check every span against the medium as it is copied, and stop if the medium contradicts itself |
 | `--all-devices` | List every attached FAT volume, holding nothing back |
 | `--verbose` | Per-object and per-cluster relocation detail |
 | `--help`, `-h` | Show usage |
@@ -297,6 +298,27 @@ Two things worth knowing before you point it at something you care about:
   them back over ours whenever it pleases. Unmount the volume but leave the device attached.
 - **Back up anything irreplaceable.** The design is careful and the failure mode is benign, but this
   is a tool that rewrites filesystem metadata on removable media. Use `--dry-run` first.
+
+### When the medium itself is the problem
+
+The argument above assumes the device answers honestly. One that does not defeats all of it: a
+defragmenter reads every byte it moves, and if a read comes back with the wrong contents, the copy is
+written faithfully to the right place. The FAT agrees, every pointer agrees, the lengths agree, `fsck`
+is content, and the data is wrong. Nothing in the filesystem records that it happened.
+
+Two defences, and the first needs no asking for:
+
+- **Transfer sizes come from the device.** Both platforms publish the largest read and write they
+  will accept, and that is honoured rather than guessed at. A USB card reader measured during
+  development advertises 128 KiB; asking it for a megabyte returned the right *length* of the wrong
+  bytes, silently, and destroyed four directories before it was found. Where a device asks for less
+  than the default, the run says so.
+- **`--verify-copies` reads every span twice**, by two different routes, and stops the run if the two
+  answers differ. It roughly doubles the read traffic of the copy phase, so it is off by default and
+  unnecessary on hardware you trust — but it is the only thing that can catch a medium that lies, and
+  a run that completes with it on has had every copied byte confirmed. Worth it for a card that has
+  produced unexplained corruption, a reader you are unsure of, or a volume that matters more than the
+  extra time.
 
 ## Measurement harness
 

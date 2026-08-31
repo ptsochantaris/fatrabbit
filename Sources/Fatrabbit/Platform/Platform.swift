@@ -2,7 +2,7 @@ import Foundation
 
 /// Everything fatrabbit needs from the operating system that the operating systems disagree about.
 ///
-/// The whole of the platform surface is the eight members declared below, each implemented once per
+/// The whole of the platform surface is the nine members declared below, each implemented once per
 /// platform in a file of its own. Nothing else in the codebase carries an `#if`: the FAT format
 /// layer, the planners, the defragmenter and the display are the same code everywhere, which is
 /// most of the reason this seam is worth having as a seam rather than as conditionals in place.
@@ -42,6 +42,13 @@ import Foundation
 /// On Linux there is one node and the function is the identity — which is not the end of that
 /// story, because the observability the raw node buys is what `O_DIRECT` would have to restore.
 /// That decision is deliberately not made here.
+///
+/// **How large a transfer the device will accept.** `maximumTransfer` is
+/// `DKIOCGETMAXBYTECOUNTREAD` against `BLKSECTGET`. This one is here because guessing it destroyed
+/// data: the copy path used a hardcoded megabyte, a USB card reader that publishes 131,072 bytes
+/// answered those reads with the right length of the wrong bytes and no error at any level, and an
+/// image file — which publishes 2,097,152 — could never reproduce it. Both platforms will say if
+/// asked; neither volunteers.
 ///
 /// **Whether anything underneath us is already caching.** `isUncached` decides whether
 /// `FATVolume` keeps its own metadata cache.

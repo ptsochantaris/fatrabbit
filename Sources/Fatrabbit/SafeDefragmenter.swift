@@ -102,7 +102,7 @@ final class SafeDefragmenter {
     private(set) var wasInterrupted = false
 
     init(volume: FATVolume, plan: DefragPlan, report: Reporter, cleanup: MacCleanup?,
-         fast: Bool = false) {
+         fast: Bool = false, verifyCopies: Bool = false) {
         self.volume = volume
         self.plan = plan
         self.report = report
@@ -111,7 +111,8 @@ final class SafeDefragmenter {
         self.objects = plan.ordered
         self.fat = volume.fat
         self.lastCluster = volume.countOfClusters + 1
-        self.copies = CopyBatch(volume: volume, budget: Self.maxCopySpan)
+        self.copies = CopyBatch(volume: volume, budget: Self.maxCopySpan,
+                                verifyReads: verifyCopies)
 
         var owners = [Int32](repeating: -1, count: Int(volume.countOfClusters) + 2)
         for (index, object) in plan.ordered.enumerated() {
@@ -621,9 +622,13 @@ final class SafeDefragmenter {
     /// read per directory actually moved rather than one per directory on the volume, and nothing at
     /// all on a volume that was already in order.
     ///
-    /// Where a number did change, the entry is read back rather than taken on trust. That read is
-    /// the only end-to-end evidence that the pointer writes reached the medium, and it is worth
-    /// having for the part of this that would be most expensive to get wrong.
+    /// Where a number did change, the entry is read back rather than taken on trust — and the read
+    /// answers a blunter question than it appears to. It cannot prove the pointer reached the
+    /// medium, because a directory's clusters are cached as they are written and the hit returns
+    /// this process's own copy. What it does catch, and what it was hardened to catch, is a
+    /// destination that was never written at all: nothing was admitted for it, so the lookup misses
+    /// and the medium answers. That is the case where this pass used to make matters worse, by
+    /// taking whatever it found for a directory and patching a pointer into it.
     private func repairDotEntries() throws(FATError) {
         var moved: [FSObject] = []
         var settled: [FSObject] = []
@@ -687,8 +692,45 @@ final class SafeDefragmenter {
                 continue
             }
 
+            // Through the cache, and that is not the weakness it first looks like.
+            //
+            // For a directory this run moved, the cached bytes came from the *write* that put it
+            // there, so a hit returns this process's own copy rather than the medium's. What saves
+            // the check below is the shape of the fault it is for: a directory whose data never
+            // reached its destination was never written, so nothing was ever admitted for it, the
+            // lookup misses, and the read goes to the medium exactly in the case that matters. That
+            // is how the original occurrence was caught. A destination written with the wrong bytes
+            // that happen to form a valid directory would slip past, and `--verify-copies` is what
+            // exists for that.
             let head = try volume.readBytes(at: volume.offset(ofCluster: first),
                                             count: 2 * DirectoryEntry.size)
+
+            // Before trusting any of it: is there a directory here at all?
+            //
+            // This pass exists to correct a stale pointer inside a directory, and every line below
+            // assumes it is looking at one. Handed something that is not, it will read two cluster
+            // numbers out of arbitrary bytes, find they disagree, and patch eight bytes of a `.`
+            // pointer into the middle of whatever is actually there — turning a directory that never
+            // arrived into a volume that looks entirely consistent and passes fsck.
+            //
+            // That is not hypothetical. On the card this was found on, all four destroyed
+            // directories carried their own cluster number at exactly this offset, sitting inside a
+            // ZX Spectrum tape image: the run had written the fingerprint of its own repair into
+            // stale file data and then reported success. A directory whose first cluster does not
+            // begin with `.` and `..` has lost its contents, and the only honest thing to do with
+            // that is stop.
+            let dotName = head.span.oemText(dot ..< dot + 11)
+            let dotDotName = head.span.oemText(dotDot ..< dotDot + 11)
+            guard dotName == ".          ", dotDotName == "..         " else {
+                throw FATError.corruption("""
+                    \(object.label) is at cluster \(start), which the FAT and its parent entry both \
+                    name, but the medium holds no directory there — so its contents were lost while \
+                    everything pointing at it landed. Refusing to write a '.' entry into it, which \
+                    would leave the volume looking consistent. First 11 bytes: \
+                    \(Array(head[dot ..< dot + 11]))
+                    """)
+            }
+
             let field = DirectoryEntry.pointerFieldOffset
             let dotValue = DirectoryEntry.firstCluster(in: head, at: dot + field)
             let dotDotValue = DirectoryEntry.firstCluster(in: head, at: dotDot + field)

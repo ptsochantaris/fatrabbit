@@ -285,6 +285,29 @@ extension System {
     ///
     /// Character devices are still accepted, so a raw node reached through some other mechanism
     /// behaves as it would on Darwin.
+    /// `BLKSECTGET` from `<linux/fs.h>`: the largest number of 512-byte sectors the block layer
+    /// will put in one request. Spelled out for the same reason its Darwin counterparts are.
+    private static let sectorsPerRequest: UInt = 0x1267
+
+    /// The largest transfer this device says it will accept, or nil where it will not say.
+    ///
+    /// The counterpart to Darwin's `DKIOCGETMAXBYTECOUNT*`, and the reason both exist is a fault
+    /// that cost data: the copy path used to issue megabyte reads on the strength of a hardcoded
+    /// guess, and a USB card reader that advertises 131,072 bytes answered them with the right
+    /// length of the wrong bytes and no error. Asking is cheap; guessing was not.
+    ///
+    /// `BLKSECTGET` reports sectors rather than bytes and, unlike Darwin, gives one figure for both
+    /// directions. It writes a `short` on older kernels and an `unsigned int` on newer ones, so the
+    /// value is read into the wider type with the upper half pre-zeroed, which is correct either
+    /// way on a little-endian machine and is why this does not simply take a `CUnsignedShort`.
+    static func maximumTransfer(_ descriptor: Int32) -> Int? {
+        var value: UInt32 = 0
+        guard ioctl(descriptor, sectorsPerRequest, &value) == 0 else { return nil }
+        let sectors = Int(value)
+        guard sectors > 0 else { return nil }
+        return sectors * 512
+    }
+
     static func isUncached(_ descriptor: Int32) -> Bool {
         guard let kind = nodeKind(descriptor) else { return false }
         return kind == mode_t(S_IFBLK) || kind == mode_t(S_IFCHR)

@@ -219,6 +219,14 @@ final class LineConsumer: EventConsumer {
             line("\(geometry.flavour): \(geometry.bytesPerSector)-byte sectors, "
                 + "\(geometry.sectorsPerCluster) sectors/cluster (\(geometry.clusterSize) bytes), "
                 + "\(geometry.clusterCount) clusters.")
+            // Said only where the device asked for something smaller than this tool would otherwise
+            // have used, which is the case worth knowing about: a transfer larger than a device says
+            // it accepts is how four directories came to be destroyed on one card, and the number it
+            // states is the whole of the defence. Silence means it is not being constrained.
+            if let stated = geometry.deviceMaxTransfer, stated < FATVolume.transferCeiling {
+                line("Device accepts transfers up to \(stated / 1024) KiB, so that is what will be "
+                    + "used rather than \(FATVolume.transferCeiling / 1024) KiB.")
+            }
             // Said only where there is one, which is the two variants that keep the root outside the
             // cluster space. It explains something a run on those volumes would otherwise look odd
             // for: the root is not among the objects placed, and it never moves.

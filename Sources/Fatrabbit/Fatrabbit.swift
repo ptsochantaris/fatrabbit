@@ -150,6 +150,29 @@ struct Fatrabbit: ParsableCommand {
     @Flag(name: .shortAndLong, help: "Emit per-object and per-cluster relocation detail.")
     var verbose = false
 
+
+    @Flag(name: .customLong("verify-copies"), help: ArgumentHelp(
+        "Check every span against the medium as it is copied, and stop if the medium contradicts "
+            + "itself. For media you have reason to distrust.",
+        discussion: """
+        A defragmenter can only be as truthful as the reads it is given. Every byte it moves it \
+        first reads, and if a device answers a read with the wrong bytes there is nothing in the \
+        layout, the FAT or the directory tree to say so afterwards: the copy is faithfully written \
+        to the right place, the lengths agree, fsck is content, and the contents are simply wrong. \
+        Worse for a file than for a directory, since a directory at least has a shape to be broken.
+
+        So this reads every span twice, by two different routes, and stops the run if they disagree. \
+        A disagreement means the medium returned different answers to the same question, and no \
+        amount of care in this tool can make that safe — which is why it stops rather than retrying.
+
+        Not needed on hardware you trust, and off by default for that reason: it doubles the read \
+        traffic of the copy phase. Worth switching on for a card that has produced unexplained \
+        corruption, a reader you are unsure of, or a volume whose contents matter more than the \
+        hour it costs. A run that completes with this on has had every copied byte confirmed.
+        """))
+    var verifyCopies = false
+
+
     /// The names to place first, with every occurrence and every comma-separated list flattened into
     /// one ordered run.
     var first: [String] { firstNames.flatMap(Self.splitList) }
@@ -237,7 +260,9 @@ extension Fatrabbit {
                                               bytesPerSector: volume.bpb.bytesPerSector,
                                               sectorsPerCluster: volume.bpb.sectorsPerCluster,
                                               fixedRootEntries: volume.flavour.hasRelocatableRoot
-                                                  ? nil : volume.bpb.rootEntCnt)))
+                                                  ? nil : volume.bpb.rootEntCnt,
+                                              deviceMaxTransfer: volume.deviceMaxTransfer,
+                                              transferSize: FATVolume.maxTransfer)))
         report.post(.layout(ClusterState.layout(of: volume.fat,
                                                 clusterCount: volume.countOfClusters,
                                                 badMarker: volume.flavour.badCluster)))
@@ -268,7 +293,8 @@ extension Fatrabbit {
                                             plan: plan,
                                             report: report,
                                             cleanup: deMac ? cleanup : nil,
-                                            fast: fast)
+                                            fast: fast,
+                                            verifyCopies: verifyCopies)
         try defragmenter.run()
         return defragmenter.wasInterrupted
     }

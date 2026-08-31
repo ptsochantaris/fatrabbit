@@ -253,6 +253,37 @@ extension System {
     /// only thing here with no page cache beneath it. A block device — `/dev/diskN` — is excluded
     /// deliberately rather than overlooked: the kernel buffers it, so a second copy would be the
     /// same waste it is against a file.
+    /// `DKIOCGETMAXBYTECOUNTREAD` and its write twin, from `<sys/disk.h>`. Written out because
+    /// `_IOR` is a macro and macros of this shape do not come across into Swift.
+    private static let maxByteCountRead: UInt = 0x4008_6446
+    private static let maxByteCountWrite: UInt = 0x4008_6447
+
+    /// The largest transfer this device says it will accept, or nil where it will not say.
+    ///
+    /// Worth having because the alternative was a guess, and the guess was wrong in a way that
+    /// destroyed data. A megabyte was chosen as "a multiple of every plausible block size", which
+    /// conflated two unrelated things: how a transfer must be *aligned*, and how large it may be.
+    /// A USB card reader measured here advertises 131,072 bytes, so every megabyte-sized read the
+    /// copy path issued was eight times over a published limit — and on that reader an oversized
+    /// read comes back holding the right length of the wrong bytes, from 65,536 bytes away, with no
+    /// error anywhere. An `hdiutil` image on the same machine advertises 2,097,152, which is why
+    /// none of this was ever visible against an image.
+    ///
+    /// The smaller of the two directions is taken, since one number governs both paths here, and
+    /// zero is treated as no answer rather than as a limit of nothing. Nil for anything that is not
+    /// a disk — a plain file has no such limit and the ioctl fails — and the caller keeps its own
+    /// ceiling for that case.
+    static func maximumTransfer(_ descriptor: Int32) -> Int? {
+        var limits: [UInt64] = []
+        for request in [maxByteCountRead, maxByteCountWrite] {
+            var value: UInt64 = 0
+            guard ioctl(descriptor, request, &value) == 0, value > 0 else { continue }
+            limits.append(value)
+        }
+        guard let smallest = limits.min(), smallest > 0 else { return nil }
+        return Int(smallest)
+    }
+
     static func isUncached(_ descriptor: Int32) -> Bool {
         nodeKind(descriptor) == mode_t(S_IFCHR)
     }

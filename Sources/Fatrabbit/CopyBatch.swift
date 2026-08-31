@@ -90,9 +90,29 @@ final class CopyBatch {
     private(set) var editsFolded = 0
     private(set) var editsWritten = 0
 
-    init(volume: FATVolume, budget: Int) {
+    /// When set, every span's read is performed a second time straight off the medium and the two
+    /// answers compared.
+    ///
+    /// This is aimed at one measured fault and nothing else. On a 33 GB card, a group of spans in a
+    /// single generation read their source data from an offset exactly 65,536 bytes — four 16 KB
+    /// clusters — below where they should have, and wrote those wrong bytes to the right
+    /// destinations. The write path is already exonerated: the destinations were correct, the
+    /// lengths were correct, and nothing else in the run touched them. What is left is the read,
+    /// and the only thing in the read path that could answer differently on two consecutive calls
+    /// is the cache.
+    ///
+    /// So this asks the cache and the medium the same question and compares. A disagreement is
+    /// reported with the offset it swept back to find the bytes actually returned, which names the
+    /// discrepancy outright rather than leaving it to be inferred from the wreckage afterwards.
+    ///
+    /// It doubles the read traffic of the copy phase, so it is for a run somebody is deliberately
+    /// watching.
+    private let verifyReads: Bool
+
+    init(volume: FATVolume, budget: Int, verifyReads: Bool = false) {
         self.volume = volume
         self.budget = budget
+        self.verifyReads = verifyReads
     }
 
     /// Queues a copy of `count` bytes. A span as large as the whole budget is already a sequential
@@ -193,6 +213,7 @@ final class CopyBatch {
             report?(Activity(writing: false, index: index, total: spans.count,
                              offset: spans[index].source, count: spans[index].count, done: false))
             spans[index].data = try volume.readRaw(at: spans[index].source, count: spans[index].count)
+            if verifyReads { try checkRead(spans[index]) }
             report?(Activity(writing: false, index: index, total: spans.count,
                              offset: spans[index].source, count: spans[index].count, done: true))
         }
@@ -230,7 +251,22 @@ final class CopyBatch {
 
         spans.sort { $0.destination < $1.destination }
         for (index, span) in spans.enumerated() {
-            guard let data = span.data else { continue }
+            // Every span was read above, so this cannot be nil — and if it ever is, the copy is
+            // being dropped on the floor. That is not a condition to skip past: the FAT entries
+            // allocating this destination go out at the next commit regardless, so the volume ends
+            // up naming a cluster that was never written, which reads back as a directory or a file
+            // full of whatever the previous occupant left. Silence here would make that indetectable
+            // from the outside, which is exactly what a run leaving four destroyed directories
+            // behind and reporting success looks like.
+            guard let data = span.data else {
+                throw FATError.io("internal error: queued copy of \(span.count) bytes to offset "
+                    + "\(span.destination) was never read, so it cannot be written; "
+                    + "refusing to allocate a destination holding stale data")
+            }
+            guard data.count == span.count else {
+                throw FATError.io("internal error: read \(data.count) bytes for a \(span.count)-byte "
+                    + "copy to offset \(span.destination); refusing to write a short or overlong span")
+            }
             report?(Activity(writing: true, index: index, total: spans.count,
                              offset: span.destination, count: span.count, done: false))
             try volume.writeRaw(data, at: span.destination, retaining: span.retention)
@@ -245,6 +281,68 @@ final class CopyBatch {
             editsWritten += 1
             try volume.setFirstCluster(at: fix.destination, to: fix.cluster)
         }
+    }
+
+    /// Asks the medium the same question the read just asked, and compares the answers.
+    ///
+    /// On a disagreement it goes looking for where the returned bytes actually live, sweeping
+    /// cluster by cluster either side of the span's source. That sweep is the whole point: knowing
+    /// a read was wrong is worth little, and knowing it came from exactly four clusters below is
+    /// worth everything. The window is deliberately wide enough to catch a much larger slip than
+    /// the one measured, so a different offset does not go unnamed.
+    private func checkRead(_ span: Span) throws(FATError) {
+        guard let held = span.data else { return }
+        let fresh = try volume.readUncached(at: span.source, count: span.count)
+        let agrees = held.withUnsafeBytes { buffer in buffer.elementsEqual(fresh) }
+        if agrees { return }
+
+        // Where the two first part company, which bounds how much of the span is wrong.
+        var firstDifference = -1
+        held.withUnsafeBytes { buffer in
+            for index in 0 ..< min(buffer.count, fresh.count) where buffer[index] != fresh[index] {
+                firstDifference = index
+                break
+            }
+        }
+
+        // Sweep for the bytes that actually came back. Compared over one cluster, which is enough
+        // to identify an offset and cheap enough to try sixty-four of them.
+        let clusterSize = volume.clusterSize
+        let probeSize = min(span.count, clusterSize)
+        var landedAt: String = "not found within 64 clusters either side"
+        for step in 1 ... 64 {
+            for direction in [-step, step] {
+                let shift = Int64(direction) * Int64(clusterSize)
+                let candidate = Int64(span.source) + shift
+                guard candidate >= 0 else { continue }
+                guard let bytes = try? volume.readUncached(at: UInt64(candidate), count: probeSize)
+                else { continue }
+                let same = held.withUnsafeBytes { buffer in
+                    buffer.prefix(probeSize).elementsEqual(bytes)
+                }
+                if same {
+                    landedAt = "the bytes returned are those at offset \(candidate) — "
+                        + "\(direction) cluster(s), \(shift) bytes, from where they were asked for"
+                    break
+                }
+            }
+            if !landedAt.hasPrefix("not found") { break }
+        }
+
+        throw FATError.io("""
+            The medium contradicted itself. \(span.count) bytes read at offset \(span.source) came \
+            back differing from the same range read again by another route, first at byte \
+            \(firstDifference). \(landedAt). This copy was bound for offset \(span.destination), so \
+            writing it would have put the wrong data there with nothing afterwards to show it.
+
+            Nothing this tool does can make that safe, so the run has stopped rather than carry the \
+            bytes forward. Two reads of one unchanging range disagreed, which is the device, its \
+            reader, or the connection between them — not the layout, the filesystem, or this \
+            volume's contents. Everything written before this point was verified the same way. The \
+            volume is left marked dirty, and the detail below is what to send to whoever asks.
+            Span: source \(span.source), count \(span.count), retention \(span.retention), \
+            \(spans.count) spans in this batch, \(spansFused) fused so far, pass \(passes).
+            """)
     }
 
     /// Whether `span` covers the whole of the `count` bytes at `destination`.
