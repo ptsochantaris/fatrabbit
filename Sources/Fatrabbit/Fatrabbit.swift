@@ -44,7 +44,7 @@ struct Fatrabbit: ParsableCommand {
         // from a tarball rather than built from a checkout has no other way to say which one it is.
         // This string is the release number written by hand, and the one thing here that has to move
         // in step with the git tag — Homebrew's own test asserts the two agree.
-        version: "1.0.0"
+        version: "1.0.1"
     )
 
     @Argument(help: ArgumentHelp(
