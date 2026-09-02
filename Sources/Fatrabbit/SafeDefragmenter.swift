@@ -112,7 +112,7 @@ final class SafeDefragmenter {
         self.fat = volume.fat
         self.lastCluster = volume.countOfClusters + 1
         self.copies = CopyBatch(volume: volume, budget: Self.maxCopySpan,
-                                verifyReads: verifyCopies)
+                                verifyCopies: verifyCopies)
 
         var owners = [Int32](repeating: -1, count: Int(volume.countOfClusters) + 2)
         for (index, object) in plan.ordered.enumerated() {

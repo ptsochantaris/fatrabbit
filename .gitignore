@@ -63,3 +63,6 @@ fastlane/test_output
 
 # Python bytecode from the measurement harness, which now imports across its own scripts
 __pycache__/
+
+## Build artefact of Testing/pwrite-trace.c
+Testing/libpwrite-trace.dylib

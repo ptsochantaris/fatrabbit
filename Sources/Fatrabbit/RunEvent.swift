@@ -142,8 +142,15 @@ enum RunEvent: Sendable {
         /// something unusually small is worth a reader knowing about: it used to be guessed, and the
         /// guess cost data.
         let deviceMaxTransfer: Int?
-        /// What the run will actually use: the smaller of the above and this tool's own ceiling.
+        /// What the run will actually use: the smaller of the above, this tool's own ceiling, and
+        /// whatever the medium turned out to be capable of when asked to prove it.
         let transferSize: Int
+        /// What the medium did when the number it published was put to the test, and nil where it
+        /// was not tested — a dry run must not write, and a plain file has no controller to
+        /// misbehave. Carried here rather than merely obeyed because a device caught mishandling a
+        /// transfer it advertised is the single most important thing a run can discover about the
+        /// hardware it is running on, and it should not be discoverable only by reading the source.
+        let probe: TransferProbe.Result
 
         var byteCount: UInt64 { UInt64(clusterCount) * UInt64(clusterSize) }
     }

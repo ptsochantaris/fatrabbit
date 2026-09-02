@@ -90,8 +90,9 @@ final class CopyBatch {
     private(set) var editsFolded = 0
     private(set) var editsWritten = 0
 
-    /// When set, every span's read is performed a second time straight off the medium and the two
-    /// answers compared.
+    /// When set, every span is checked in both directions: its read is performed a second time
+    /// straight off the medium and the two answers compared, and after it is written the destination
+    /// is read back and compared against the bytes that were sent.
     ///
     /// This is aimed at one measured fault and nothing else. On a 33 GB card, a group of spans in a
     /// single generation read their source data from an offset exactly 65,536 bytes — four 16 KB
@@ -105,14 +106,29 @@ final class CopyBatch {
     /// reported with the offset it swept back to find the bytes actually returned, which names the
     /// discrepancy outright rather than leaving it to be inferred from the wreckage afterwards.
     ///
-    /// It doubles the read traffic of the copy phase, so it is for a run somebody is deliberately
-    /// watching.
-    private let verifyReads: Bool
+    /// The write half was added after a reader was caught doing something the read half could never
+    /// have seen: handed a 131,072-byte write it advertised, it performed a single 65,536-byte write
+    /// of the payload's *second* half, placed it at the *first* half's address, left the rest
+    /// untouched, and returned 131,072 with no error anywhere. `TransferProbe` now catches that
+    /// particular shape at startup, but a probe can only provoke the patterns it knows about. This
+    /// checks what actually landed, every span, which needs to know nothing about the fault.
+    ///
+    /// It is also the only check placed where a failure is free. The copy phase is the one moment
+    /// when nothing on the volume refers to the new data — the FAT entries that allocate it and the
+    /// pointers that name it are both written later, by `commitPending` — so stopping here leaves
+    /// the original still live and the volume exactly as it was found.
+    ///
+    /// It adds two reads per span to the one read and one write the copy already costs, so the
+    /// traffic of the copy phase roughly doubles. What that costs in wall clock depends entirely on
+    /// the medium: measured at +23% against an image, where the page cache absorbs the re-reads, and
+    /// considerably more against a card, where every one of them is a real transfer. Either way it
+    /// is for a run somebody is deliberately watching.
+    private let verifies: Bool
 
-    init(volume: FATVolume, budget: Int, verifyReads: Bool = false) {
+    init(volume: FATVolume, budget: Int, verifyCopies: Bool = false) {
         self.volume = volume
         self.budget = budget
-        self.verifyReads = verifyReads
+        self.verifies = verifyCopies
     }
 
     /// Queues a copy of `count` bytes. A span as large as the whole budget is already a sequential
@@ -213,7 +229,7 @@ final class CopyBatch {
             report?(Activity(writing: false, index: index, total: spans.count,
                              offset: spans[index].source, count: spans[index].count, done: false))
             spans[index].data = try volume.readRaw(at: spans[index].source, count: spans[index].count)
-            if verifyReads { try checkRead(spans[index]) }
+            if verifies { try checkRead(spans[index]) }
             report?(Activity(writing: false, index: index, total: spans.count,
                              offset: spans[index].source, count: spans[index].count, done: true))
         }
@@ -270,6 +286,7 @@ final class CopyBatch {
             report?(Activity(writing: true, index: index, total: spans.count,
                              offset: span.destination, count: span.count, done: false))
             try volume.writeRaw(data, at: span.destination, retaining: span.retention)
+            if verifies { try checkWrite(span, data) }
             report?(Activity(writing: true, index: index, total: spans.count,
                              offset: span.destination, count: span.count, done: true))
             spansCopied += 1
@@ -293,8 +310,7 @@ final class CopyBatch {
     private func checkRead(_ span: Span) throws(FATError) {
         guard let held = span.data else { return }
         let fresh = try volume.readUncached(at: span.source, count: span.count)
-        let agrees = held.withUnsafeBytes { buffer in buffer.elementsEqual(fresh) }
-        if agrees { return }
+        if CopyBatch.same(held, fresh) { return }
 
         // Where the two first part company, which bounds how much of the span is wrong.
         var firstDifference = -1
@@ -318,7 +334,9 @@ final class CopyBatch {
                 guard let bytes = try? volume.readUncached(at: UInt64(candidate), count: probeSize)
                 else { continue }
                 let same = held.withUnsafeBytes { buffer in
-                    buffer.prefix(probeSize).elementsEqual(bytes)
+                    bytes.withUnsafeBytes { other in
+                        memcmp(buffer.baseAddress!, other.baseAddress!, probeSize) == 0
+                    }
                 }
                 if same {
                     landedAt = "the bytes returned are those at offset \(candidate) — "
@@ -343,6 +361,83 @@ final class CopyBatch {
             Span: source \(span.source), count \(span.count), retention \(span.retention), \
             \(spans.count) spans in this batch, \(spansFused) fused so far, pass \(passes).
             """)
+    }
+
+    /// Reads back what was just written and compares it with what was sent.
+    ///
+    /// Straight off the medium rather than through the cache, which is the whole point: the write
+    /// admitted its own bytes on the way past, so a cached read would be this process agreeing with
+    /// itself. On a disagreement it sweeps for where the payload actually landed, because knowing a
+    /// write went astray is worth little and knowing it went 65,536 bytes low is worth everything —
+    /// that offset is what turned an unexplained card into a one-line startup check.
+    private func checkWrite(_ span: Span, _ sent: Data) throws(FATError) {
+        let back = try volume.readUncached(at: span.destination, count: span.count)
+        if CopyBatch.same(sent, back) { return }
+
+        var firstDifference = -1
+        sent.withUnsafeBytes { buffer in
+            for index in 0 ..< min(buffer.count, back.count) where buffer[index] != back[index] {
+                firstDifference = index
+                break
+            }
+        }
+
+        // Where did the bytes go? Sweep either side a cluster at a time, looking for the payload's
+        // opening bytes. Wide enough to catch a much larger slip than the one measured, so a
+        // different offset is named rather than going unreported.
+        let clusterSize = volume.clusterSize
+        let probeSize = min(span.count, clusterSize)
+        var landedAt = "not found within 64 clusters either side"
+        let opening = sent.prefix(probeSize)
+        for step in 1 ... 64 {
+            for direction in [-step, step] {
+                let shift = Int64(direction) * Int64(clusterSize)
+                let candidate = Int64(span.destination) + shift
+                guard candidate >= 0 else { continue }
+                guard let bytes = try? volume.readUncached(at: UInt64(candidate), count: probeSize)
+                else { continue }
+                if CopyBatch.same(Data(opening), bytes) {
+                    landedAt = "the bytes sent are at offset \(candidate) instead — "
+                        + "\(shift) bytes, \(direction) cluster(s), from where they were written"
+                    break
+                }
+            }
+            if !landedAt.hasPrefix("not found") { break }
+        }
+
+        throw FATError.io("""
+            The medium did not keep what it was given. \(span.count) bytes were written to offset \
+            \(span.destination), the write returned success, and reading the same range straight \
+            back off the medium returned different bytes, first differing at byte \
+            \(firstDifference). \(landedAt).
+
+            A device that acknowledges a write it did not perform cannot be defragmented safely, so \
+            the run has stopped rather than carry on. This was caught in the copy phase, which is \
+            the one place it costs nothing: no FAT entry allocates these clusters yet and nothing \
+            points at them, so the volume is exactly as it was found and the original data is still \
+            live where it always was.
+
+            Span: destination \(span.destination), source \(span.source), count \(span.count), \
+            retention \(span.retention), transfer size \(FATVolume.maxTransfer), pass \(passes).
+            """)
+    }
+
+    /// Whether two buffers hold the same bytes, compared a word at a time rather than an element at
+    /// a time.
+    ///
+    /// `elementsEqual` on an `UnsafeRawBufferPointer` against an array goes through `Sequence`, which
+    /// is a byte-at-a-time loop with a witness-table call per byte. Verifying a run compares a
+    /// gigabyte twice over, and doing that generically took a two-minute volume to two and a half
+    /// minutes of comparison alone — most of the cost of `--verify-copies` was not the extra reads it
+    /// exists for.
+    private static func same(_ left: Data, _ right: [UInt8]) -> Bool {
+        guard left.count == right.count else { return false }
+        if left.isEmpty { return true }
+        return left.withUnsafeBytes { a in
+            right.withUnsafeBytes { b in
+                memcmp(a.baseAddress!, b.baseAddress!, left.count) == 0
+            }
+        }
     }
 
     /// Whether `span` covers the whole of the `count` bytes at `destination`.

@@ -44,7 +44,7 @@ struct Fatrabbit: ParsableCommand {
         // from a tarball rather than built from a checkout has no other way to say which one it is.
         // This string is the release number written by hand, and the one thing here that has to move
         // in step with the git tag — Homebrew's own test asserts the two agree.
-        version: "1.0.1"
+        version: "1.0.2"
     )
 
     @Argument(help: ArgumentHelp(
@@ -152,8 +152,8 @@ struct Fatrabbit: ParsableCommand {
 
 
     @Flag(name: .customLong("verify-copies"), help: ArgumentHelp(
-        "Check every span against the medium as it is copied, and stop if the medium contradicts "
-            + "itself. For media you have reason to distrust.",
+        "Check every span against the medium in both directions as it is copied, and stop if the "
+            + "medium contradicts itself. For media you have reason to distrust.",
         discussion: """
         A defragmenter can only be as truthful as the reads it is given. Every byte it moves it \
         first reads, and if a device answers a read with the wrong bytes there is nothing in the \
@@ -165,10 +165,24 @@ struct Fatrabbit: ParsableCommand {
         A disagreement means the medium returned different answers to the same question, and no \
         amount of care in this tool can make that safe — which is why it stops rather than retrying.
 
-        Not needed on hardware you trust, and off by default for that reason: it doubles the read \
-        traffic of the copy phase. Worth switching on for a card that has produced unexplained \
+        The other direction is checked too, and for a reason found the hard way. A reader measured \
+        here was handed a 131,072-byte write of the size it advertises, performed a single \
+        65,536-byte write of the payload's second half, placed it at the first half's address, and \
+        returned success. Nothing about the read path could have seen that. So every span is also \
+        read back off the medium after it is written and compared with what was sent.
+
+        That check sits where a failure is free. The copy phase is the one moment when nothing on \
+        the volume refers to the new data — the FAT entries that allocate it and the pointers that \
+        name it are both written afterwards — so stopping there leaves the original live and the \
+        volume exactly as it was found. The transfer probe at startup catches the one misbehaviour \
+        that has been characterised and measured; this catches whatever has not been.
+
+        Not needed on hardware you trust, and off by default for that reason: it roughly doubles the \
+        traffic of the copy phase, which measured +23% of wall clock against an image and costs more \
+        against a card, where every extra read is a real transfer. Worth switching on for a card that has produced unexplained \
         corruption, a reader you are unsure of, or a volume whose contents matter more than the \
-        hour it costs. A run that completes with this on has had every copied byte confirmed.
+        hour it costs. A run that completes with this on has had every copied byte confirmed in \
+        both directions.
         """))
     var verifyCopies = false
 
@@ -253,6 +267,50 @@ extension Fatrabbit {
                                             deMac: deMac)))
 
         let volume = try FATVolume(path: source, dryRun: dryRun)
+
+        // Put the number the device published to the test before trusting a gigabyte of somebody's
+        // data to it. A reader measured here states 131,072 twice over, consistently, and mishandles
+        // it — writing 65,536 bytes of the wrong half to the wrong address, returning success, and
+        // costing 177 files. Asking is cheap; being wrong is not.
+        //
+        // Skipped where it cannot apply. A dry run must not write. A plain image has no controller
+        // to misbehave, and answers no transfer-limit ioctl at all, which is the signal used. And a
+        // volume with no spare run to write into is left alone rather than squeezed.
+        let probe: TransferProbe.Result
+        if dryRun {
+            // A dry run cannot write, but it can still ask the medium whether it reads consistently
+            // — and it must, because the whole run is reads, and reading at a size the medium
+            // mishandles produces a report about the ruler rather than about the volume.
+            let stated = FATVolume.maxTransfer
+            if volume.deviceMaxTransfer != nil,
+               let region = TransferProbe.spareRegion(
+                   in: volume,
+                   wanting: TransferProbe.spaceRequired(forStated: stated),
+                   atLeast: TransferProbe.spaceRequired(forStated: stated)).region {
+                let outcome = try TransferProbe.measureReadsOnly(volume: volume, region: region)
+                FATVolume.maxTransfer = outcome.chosen
+                probe = .readsOnly(outcome)
+            } else {
+                probe = .dryRun
+            }
+        } else if volume.deviceMaxTransfer == nil {
+            probe = .notADevice
+        } else {
+            let stated = FATVolume.maxTransfer
+            let found = TransferProbe.spareRegion(
+                in: volume,
+                wanting: TransferProbe.spacePreferred(forStated: stated),
+                atLeast: TransferProbe.spaceRequired(forStated: stated))
+            if let region = found.region {
+                let outcome = try TransferProbe.measure(volume: volume, region: region)
+                FATVolume.maxTransfer = outcome.chosen
+                probe = .measured(outcome)
+            } else {
+                probe = .noRoom(largestFreeRun: found.largest,
+                                needed: TransferProbe.spaceRequired(forStated: stated))
+            }
+        }
+
         report.post(.opened(RunEvent.Geometry(label: volume.label,
                                               flavour: volume.flavour.name,
                                               clusterSize: volume.clusterSize,
@@ -262,7 +320,8 @@ extension Fatrabbit {
                                               fixedRootEntries: volume.flavour.hasRelocatableRoot
                                                   ? nil : volume.bpb.rootEntCnt,
                                               deviceMaxTransfer: volume.deviceMaxTransfer,
-                                              transferSize: FATVolume.maxTransfer)))
+                                              transferSize: FATVolume.maxTransfer,
+                                              probe: probe)))
         report.post(.layout(ClusterState.layout(of: volume.fat,
                                                 clusterCount: volume.countOfClusters,
                                                 badMarker: volume.flavour.badCluster)))

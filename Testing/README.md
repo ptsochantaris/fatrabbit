@@ -1515,8 +1515,102 @@ same thing, and the reasons to think so are the ones listed above as exoneration
 
 Not proven — that was a different card, and nothing was kept from it. But the correlation runs the
 right way in every particular, and the one measurement nobody took was the cheap one: a single ioctl
-asking what the device would accept. Which is now taken on every run, and reported when the answer
-is smaller than the ceiling.
+asking what the device would accept.
+
+That ioctl is now taken on every run. It also turned out not to be enough, which is the next section.
+
+## The card that lied, and how long it took to prove it
+
+A second card produced the same shape of fault *after* the transfer limit was being honoured, and
+this one was kept. It is characterised exactly, reproducible in under a second, and the tool now
+detects it at startup. The reason to write it up at length is not the fault; it is the six wrong
+turns, because every one of them looked conclusive at the time.
+
+**What the device does.** The reader states a maximum transfer of 131,072 bytes twice over and
+consistently — `DKIOCGETMAXBYTECOUNTWRITE` says 131,072, `DKIOCGETMAXBLOCKCOUNTWRITE` says 256
+against a 512-byte block. Both are wrong. One pattern breaks it:
+
+    two or more back-to-back transfers at the maximum size, contiguous on the medium
+    a discontiguity of exactly half that size
+    one more transfer at the maximum size    <- this one goes astray
+
+On the write side that last transfer becomes a single 65,536-byte write carrying the payload's
+*second* half, deposited at the *first* half's address. The first half is never written anywhere, the
+second half's own destination is never touched, `pwrite` returns 131,072, and nothing reports an
+error — `Retries` and `Errors` in the driver's own statistics both stay at zero across 3.85 million
+operations. On the read side the same pattern is far worse: a 131,072-byte read after that run-up
+disagreed with the same range read in 4 KiB pieces at **361 of 400** positions, against roughly
+**three bad writes in 107,801**.
+
+The boundary is hard at 2¹⁶ and is not an overflow by a few bytes of command overhead: 130,560 fails
+exactly as 131,072 does, as do 129,024, 122,880 and 98,304, and only at 65,536 does it come good.
+Every gap other than half the size is fine. Every smaller size is fine at every gap.
+
+Nothing else on the machine asks for that shape. macOS writes 131,072-byte transfers to the same
+reader all day — measured, 4,168 of them in a 512 MB copy — and loses nothing, because a file copy
+never lays writes out as a long contiguous run punctuated by a half-size hole. `CopyBatch.flush`
+does, necessarily: it writes a generation's spans in destination order. One run of 727,778 writes
+lost 338 clusters and a directory that way, and reported a single error an hour in.
+
+**The six wrong turns.** Each of these was measured, and each came back clean:
+
+- **The medium.** 30 GiB written in four patterns, ~190,000 transfers — sequential at 128 KiB,
+  interleaved 1:1 with distant reads, sequential at 64 KiB, and a generation model with sources and
+  destinations 202 clusters apart. Zero displacement. All of it in the unallocated tail, which is
+  the part a run never hammers.
+- **The tool's logic.** An image matching the card in extent, cluster size, fill level and *contents*
+  moved 388,624 objects and 1,427,815 clusters with all 273,092 files byte-identical. It only became
+  a fair test once `pwrite-trace.c` was made to cap what the device reports, since an image
+  advertises 2 MiB and so never enters the regime the card runs in — which is why this family of
+  fault had never once appeared against an image.
+- **The tool's arithmetic.** A trace of all 727,778 writes showed the cap never exceeded, zero short
+  transfers, and two records out of 638,847 not block-aligned (a 107-byte read of another file). The
+  offsets were right; the data did not arrive.
+- **Buffer alignment.** A promising theory — a 131,072-byte transfer spans 32 pages from an aligned
+  buffer and 33 from a malloc'd one — and dead on arrival: all 1,815 of the tool's large writes come
+  from page-aligned buffers, the same as macOS's. Replaying with `mmap` buffers failed identically,
+  the same 412 blocks at the same offsets.
+- **Scatter-gather limits.** No USB device on the machine publishes `IOMaximumSegmentCountWrite` or
+  `IOMaximumSegmentByteCountWrite` — not this reader, not the built-in SDXC reader, not a Samsung
+  portable drive. Only NVMe and internal buses do. So the number that would have revealed the real
+  constraint is not obtainable by asking.
+- **Retries.** `Retry Count = 20` with 30-second timeouts in the driver's `Protocol
+  Characteristics` made a retried `WRITE(10)` attractive as a mechanism. The statistics say zero
+  retries and zero errors.
+
+**What actually found it.** Replaying the traced run's exact I/O sequence — same offsets, same order,
+same barriers, no `fatrabbit` in the picture — lost 412 blocks, all displaced by exactly +65,536. The
+same sequence with nothing above 65,536 lost none of 37,278,362 blocks checked. From there,
+bisection: the failure survived a 4-transfer run-up and vanished at 2, which turned days of work into
+a table that prints in a second.
+
+**Two self-inflicted wounds, both worth remembering.**
+
+- **Do not verify a haunted card with the size it mishandles.** A bulk hash pass at 128 KiB reported
+  four corrupt files out of 273,050 that hashed correctly on a second attempt, and later raised a
+  false alarm that aborted a test run. Every verification tool here now reads at 64 KiB.
+- **A destructive tool must refuse, not warn.** `haunt.py` was run against a freshly restored 33 GB
+  card to check its output formatting, and wrote its pattern across roughly 400 live directories. Its
+  docstring said DESTRUCTIVE in capitals at the time. It now reads the FAT and refuses to write
+  anywhere allocated unless given `--anywhere`. A warning that has to be read at the right moment is
+  not a safeguard.
+
+**Verified.** Four rounds on that card and reader, each freeing two different root directories to
+force a fresh cascade: 4,756,981 clusters relocated, 1,269,511 objects moved, `0 objects still
+fragmented` every round, and every surviving file byte-identical before and after. The volume
+afterwards has no broken directories, no `.` mismatches, no bad chains, no cross-links, no size
+mismatches and no orphans.
+
+**And it is faster.** Throughput on that reader climbs monotonically to 64 KiB and then falls off a
+cliff — 18.9 MB/s of writes at 64 KiB against 13.6 at 128, and 20.5 against 15.7 for reads. The
+fastest size and the largest safe size are the same size, so the ceiling costs nothing. A size that
+is anomalously slow is worth treating as a warning in its own right, which is why the probe times
+what it tests.
+
+The tools: [`haunt.py`](haunt.py) asks a device the question directly and prints the table;
+[`pwrite-trace.c`](pwrite-trace.c) records every transfer beneath the tool and can cap what the
+device reports, which is what makes an image a fair test; [`card-session.sh`](card-session.sh)
+captures paired images and traces across a sequence of runs.
 
 ## Getting write access to a device
 

@@ -302,24 +302,35 @@ Two things worth knowing before you point it at something you care about:
 
 ### When the medium itself is the problem
 
-The argument above assumes the device answers honestly. One that does not defeats all of it: a
-defragmenter reads every byte it moves, and if a read comes back with the wrong contents, the copy is
-written faithfully to the right place. The FAT agrees, every pointer agrees, the lengths agree, `fsck`
-is content, and the data is wrong. Nothing in the filesystem records that it happened.
+The argument above assumes the device answers honestly, and not all of them do. A read that comes back
+with the wrong bytes is copied faithfully to the right place: the FAT agrees, every pointer agrees,
+`fsck` is content, and the data is wrong. Nothing in the filesystem records that it happened.
 
-Two defences, and the first needs no asking for:
+Three defences, the first two automatic:
 
-- **Transfer sizes come from the device.** Both platforms publish the largest read and write they
-  will accept, and that is honoured rather than guessed at. A USB card reader measured during
-  development advertises 128 KiB; asking it for a megabyte returned the right *length* of the wrong
-  bytes, silently, and destroyed four directories before it was found. Where a device asks for less
+- **Transfer sizes come from the device** rather than being guessed at. Where a device asks for less
   than the default, the run says so.
-- **`--verify-copies` reads every span twice**, by two different routes, and stops the run if the two
-  answers differ. It roughly doubles the read traffic of the copy phase, so it is off by default and
-  unnecessary on hardware you trust — but it is the only thing that can catch a medium that lies, and
-  a run that completes with it on has had every copied byte confirmed. Worth it for a card that has
-  produced unexplained corruption, a reader you are unsure of, or a volume that matters more than the
-  extra time.
+- **The stated size is then tested**, because devices lie about it. A USB card reader measured during
+  development advertises 128 KiB and mishandles it in both directions — silently, no error at any
+  level — under a pattern that any defragmenter produces as a matter of course. One run lost 338
+  clusters and a directory that way, reporting a single error an hour in.
+
+  So each run writes a deliberately awkward pattern into spare space, reads it back, checks both
+  directions, and settles on the largest size the medium actually honours — timing the survivors and
+  taking the fastest. On that reader the answer is 64 KiB, which is also **45% faster** than the size
+  it claims. Where the test cannot run, the run says which: either there was no spare room in one
+  piece, or it was a dry run, which cannot write and so checks reads only.
+- **`--verify-copies`** checks every span in both directions as it is copied — read twice by
+  different routes, and read back off the medium after writing — and stops if the medium contradicts
+  itself. It roughly doubles the traffic of the copy phase (+23% of wall clock against an image, more
+  against a card), so it is off by default. The startup test catches the misbehaviour that has been
+  characterised; this catches the rest. Either way a failure costs nothing: no copy is referenced by
+  anything until after it is checked, so the run stops with the original still live and the volume as
+  it was found.
+
+If you verify such a card yourself, read it in transfers no larger than the size it honours. A bulk
+hash pass at a size the device mishandles will report corruption in files that are perfectly intact.
+[`Testing/haunt.py`](Testing/haunt.py) asks a device the question directly.
 
 ## Measurement harness
 

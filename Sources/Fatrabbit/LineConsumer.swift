@@ -227,6 +227,44 @@ final class LineConsumer: EventConsumer {
                 line("Device accepts transfers up to \(stated / 1024) KiB, so that is what will be "
                     + "used rather than \(FATVolume.transferCeiling / 1024) KiB.")
             }
+            // And what the medium did when that claim was tested. Said loudly where it was caught
+            // out, because a device that mishandles a transfer it advertises is the most important
+            // thing a run can learn about the hardware under it — and quietly where the only reason
+            // to back off was speed, which is a tuning note rather than a warning.
+            switch geometry.probe {
+            case .measured(let probe):
+                if probe.caughtLying {
+                    let broken = probe.attempts.filter { !$0.isSafe }.map { attempt in
+                        let how = attempt.directions.map(\.rawValue)
+                            .joined(separator: " and ")
+                        return "\(attempt.size / 1024) KiB \(how)"
+                    }.joined(separator: ", ")
+                    line("This medium mishandles \(broken) — a size it says it accepts. The bytes "
+                        + "that came back were not the bytes asked for. Using "
+                        + "\(probe.chosen / 1024) KiB, which it handles correctly.")
+                } else if probe.narrowedForSpeed {
+                    line("Medium is fastest at \(probe.chosen / 1024) KiB rather than the "
+                        + "\(probe.stated / 1024) KiB it accepts, so that is what will be used.")
+                }
+            case .noRoom(let largest, let needed):
+                // Worth saying out loud. The run is about to trust a transfer size nobody checked,
+                // and an unchecked one is what destroyed 177 files on the card this exists for.
+                line("Not enough free space in one piece to test what this medium does with a "
+                    + "\(FATVolume.maxTransfer / 1024) KiB transfer — \(largest / 1024) KiB free "
+                    + "against \(needed / 1024) KiB needed — so its own figure is being taken on "
+                    + "trust. Use --verify-copies if the contents matter.")
+            case .readsOnly(let probe):
+                if probe.caughtLying {
+                    let broken = probe.attempts.filter { !$0.isSafe }
+                        .map { "\($0.size / 1024) KiB" }.joined(separator: ", ")
+                    line("This medium reads back inconsistently at \(broken), a size it says it "
+                        + "accepts. Reading at \(probe.chosen / 1024) KiB instead, so that what "
+                        + "follows describes the volume rather than the reader. A dry run cannot "
+                        + "write, so whether it also mishandles writes is untested.")
+                }
+            case .dryRun, .notADevice:
+                break
+            }
             // Said only where there is one, which is the two variants that keep the root outside the
             // cluster space. It explains something a run on those volumes would otherwise look odd
             // for: the root is not among the objects placed, and it never moves.
