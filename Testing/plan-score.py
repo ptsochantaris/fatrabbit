@@ -42,7 +42,11 @@ gen, gens, stats = None, {}, {}
 for line in open(sys.argv[1]):
     m = re.search(r'in (\d+) generations?(?:\(s\))?, (\d+) staged', line)
     if m: stats['generations'], stats['staged'] = int(m.group(1)), int(m.group(2))
-    m = re.search(r'Would move (\d+) objects?(?:\(s\))? / (\d+) cluster', line)
+    # "Plan: 44164 moves / 85105 clusters" now, "Would move 44164 objects / 85105 clusters" before.
+    # Both spellings are accepted for the same reason the generation line's are, one line below: this
+    # printed 0 for both figures against a current build, silently, which is the one failure mode a
+    # scorer must not have — the columns it exists to compare read as though nothing was planned.
+    m = re.search(r'(?:Would move|Plan:) (\d+) (?:objects?(?:\(s\))?|moves) / (\d+) cluster', line)
     if m: stats['moves'], stats['clusters'] = int(m.group(1)), int(m.group(2))
     g = re.match(r'\s*Generation (\d+)/', line)
     if g: gen = int(g.group(1)); gens.setdefault(gen, [])

@@ -864,8 +864,11 @@ all. That does not make it free, but it halves what the figure looks like it is 
 
 - **Nothing is re-staged.** Four generations moving one object of 615 clusters reads like one object
   hitting `maxStagesPerObject` and being re-parked. Counted directly: zero objects are parked twice.
-  Staging destinations come from the top of the volume downwards and homes fill from the bottom, so a
-  parked object is never in anybody's way.
+  Staging destinations are clusters no object's home covers, so a parked object is never in anybody's
+  way. (This section was written when that was secured by taking staging from the top of the volume
+  downwards while homes filled from the bottom. It is now tested directly against `homeOwnerAt` —
+  see "The staging region belongs next to the layout, not at the far end" — which is the same
+  guarantee and does not disturb any figure here.)
 - **It is not a long grinding tail.** On a reproduction with 686 generations, **14 of them stall**; the
   other 672 place objects with no staging at all. Each stall parks about 140 small objects.
 
@@ -929,6 +932,80 @@ clusters with `newfs_msdos -F 32 -c 32 -s 4194304`, then `make-test-volume.py <m
 pathology amplified. `hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage` hands back
 user-owned nodes, so none of this needs `sudo` or the drive. A dry run plus `plan-score.py` ranks a
 candidate in about two minutes.
+
+## The staging region belongs next to the layout, not at the far end
+
+Staging destinations used to be taken from the top of the volume downwards, and the reason given was
+the one in "The staging tail" above: homes fill from the bottom, so a parked object is never in
+anybody's way. That is the right property secured the wrong way round. `homeOwnerAt` — which the
+planner already builds so that releasing a cluster wakes exactly the object waiting on it — states it
+exactly: a cluster no home covers can never be wanted by anybody. Test that directly and the guarantee
+holds at *any* distance, so the whole free region above the layout is available at whichever end of it
+we like. Both searches now start at the lowest such cluster and ascend.
+
+**What prompted it.** A run captured mid-flight on a 31.2 GiB card, FAT32, 16 KiB clusters — some 2.04M
+clusters, about 58% full. The layout frontier sat near cluster 1.19M and staging was going to 2.04M:
+**850,000 clusters, 13 GiB, out and back on every stall**, with the *Clearing* band at the far corner of
+the map being that region given up again. On a spindle that is a full stroke each way.
+
+Two figures elsewhere in this file need qualifying at that scale. "The fetch-back is served from memory
+— 85.8 MiB, not one byte of it from the drive" was measured on a 2 GiB volume; a 31 GiB volume's staged
+set will not fit the cache, so the read-back is a real read from the far end and the change saves a
+stroke each way rather than only on the write. And **`plan-score.py` cannot see this change at all**: it
+sums gaps within each generation in source order and destination order and restarts at `cost_of(0)` at
+every generation boundary, which is precisely where the stroke lives. Its verdict here is "no
+regression", not "no win".
+
+**Measured on the image reproduction** — 2 GiB, `newfs_msdos -F 32 -c 32 -s 4194304`, then
+`make-test-volume.py <mount> small 7`: 131,007 clusters, 42,047 files, 85,105 clusters in use.
+
+| | before | after |
+| --- | --- | --- |
+| Moves / clusters | 44,164 / 85,105 | **44,164 / 85,105** |
+| Generations / staged hops | 45 / 13 | **45 / 13** |
+| Transfers | 26,088 | 26,085 |
+| Predicted copy cost | 208s | 208s |
+| Staged destinations | 130,980…131,008 | **85,107…85,135** |
+| Mean staged distance | 85,128 clusters | **39,253 (−54%)** |
+| Furthest staged hop | 131,002 clusters | **85,107** |
+
+The first two rows are the ones that had to come out identical, and they are the test that the
+invariant is right rather than merely different: holding the layout fixed, nothing about which object
+goes where has changed, only which scratch cluster a stall borrows. The three transfers are noise, as
+in the cap sweep above. The residual 39,253 is the *sources* being spread through the used region —
+what moved is the destination, from the last cluster to the first one past the layout, worth 45,901
+clusters or 717 MiB of travel per hop on a volume this size.
+
+`ab-verify.py`, both builds over restores of the same snapshot: **42,000 files read back identical,
+`fsck_msdos` clean on both, and 18 byte ranges differing out of 2 GiB — every one of them inside a
+staging region**, clusters 85,107…85,135 and 130,980…131,008. The highest cluster in use is 85,106, so
+all eighteen are free, which is the only place two schedules are permitted to disagree. Nothing is
+reported as metadata, so the boot record and both FAT copies are identical. `contiguity.py`: 44,100
+objects, 0 fragmented, free space in 1 run.
+
+That last row is the half of this worth more than the seeks, and it is the salvage pass rather than
+staging. `freeRun` decides where a *stranded* object lives, not where it waits, and taken from the top
+it left permanent data at the far end of the volume — which guarantees the free space is not one run,
+and that is half of what the tool claims. From the floor it extends the compacted region instead.
+
+**SPINTEST cannot show the seek win and should not be expected to.** A 2 GiB volume on a 320 GB drive
+spans a fraction of a stroke, and USB 2.0 flattens the zone-rate difference besides; the whole effect
+is the frontier-to-end distance, which is 45,901 clusters there and 850,000 on the card that prompted
+it. The change is adopted on having been proved free and better-placed, not on a stopwatch. Run it
+there as a regression gate and expect the phase table not to move.
+
+### Two harness traps found doing this
+
+- **A dry run stops on a volume with directories to relocate.** `-n --plain --verbose` exits 1 with a
+  corruption error from `repairDotEntries`: the run writes nothing, so the destination genuinely holds
+  no directory, and the hardening described under "The transfer size has to come from the device" duly
+  refuses to write a `.` entry into it. Pre-existing and reproduced on `head`, and it lands *after* every
+  line `plan-score.py` needs, so scoring is unaffected — but the recipe at the top of that script now
+  exits non-zero, and anything checking exit status will read it as a failed capture.
+- **Never copy an image file while it is attached.** `cp` of this 2 GiB image ran at 0.8 MB/s through
+  the disk-image framework and was still going eleven minutes later, having written 518 MB. Detached,
+  `dd bs=4m` finished in 1.5 seconds at 1.4 GB/s — 1,700 times faster. Snapshot before attaching, or
+  detach first.
 
 ## One generation can hold nearly all the work, and splitting it is free
 
@@ -1267,8 +1344,8 @@ sacrifice under pressure. It had quietly become a reason never to release blocks
 A released cluster's blocks are not wrong — a write there drops them anyway — they are simply never going
 to be asked for again, and only the engine knows a release has happened. So the commit tells the cache.
 Staged data is the case that needs it: written for the sole purpose of being read back once, and sitting
-in the spare region at the top of the volume that the layout never writes to, so it is the one kind never
-dropped incidentally and would otherwise be held until the process exited.
+in the spare region above the compacted layout, which the layout never writes to, so it is the one kind
+never dropped incidentally and would otherwise be held until the process exited.
 
 | | No eviction | Releasing on free |
 | --- | --- | --- |

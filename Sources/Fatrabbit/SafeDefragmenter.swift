@@ -1050,8 +1050,8 @@ final class SafeDefragmenter {
         // And the same fact told to the cache, which cannot deduce it. These clusters hold data nothing
         // refers to any more, so anything kept for them is answering a question that will not be asked.
         // The reason to bother is staged data: it is written only to be read back once, and it sits in
-        // the spare region at the top of the volume that the layout never writes to, so it is the one
-        // kind that is never dropped incidentally and would otherwise be held until the run exited.
+        // the spare region above the compacted layout, which the layout never writes to — so it is the
+        // one kind that is never dropped incidentally and would otherwise be held until the run exited.
         volume.forget(pendingFreed)
         pendingFreed.removeAll(keepingCapacity: true)
     }

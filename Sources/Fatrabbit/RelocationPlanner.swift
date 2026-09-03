@@ -121,6 +121,28 @@ enum RelocationPlanner {
             totalClusters += count
         }
 
+        // The closest a parked object can sit to the layout without ever standing in its way.
+        //
+        // Staging used to be taken from the top of the volume downwards, and the reason given was that
+        // homes fill from the bottom, so a parked object is never in anybody's way. That is the right
+        // property and the wrong way to secure it: `homeOwnerAt` states it exactly — a cluster no home
+        // covers is one no object will ever wait for — so the guarantee holds at *any* distance, and
+        // the whole free region above the layout is available at whichever end of it we like.
+        //
+        // Which matters because the far end can be very far. On a 31.2 GiB volume 58% full, staging sat
+        // some 850,000 clusters — 13 GiB — from the content it was being taken from and handed back to,
+        // and on a spindle that is a full stroke out and another back on every stall. It is also why
+        // the fetch-back cannot be assumed free at scale: it is served from memory on a 2 GiB volume
+        // and will not fit the cache on a volume ten times that.
+        //
+        // Derived from `homeOwnerAt` rather than from `frontier`, though on most volumes they are the
+        // same cluster. `runSkippingBad` steps over bad clusters, so the home region has gaps in it,
+        // and the exact test picks up any usable cluster in one for free where `>= frontier` would step
+        // past it. It also puts the invariant at the point of use rather than leaving it an argument
+        // about where homes happened to be packed.
+        var spareFloor: UInt32 = 2
+        while spareFloor <= lastCluster, homeOwnerAt[Int(spareFloor)] >= 0 { spareFloor += 1 }
+
         // 2. Peel the work into generations.
         var current: [ClusterSet] = objects.map { $0.chain }
         var atHome = [Bool](repeating: false, count: objectCount)
@@ -139,9 +161,9 @@ enum RelocationPlanner {
         var unplaceable: [Int] = []
         var temporaryHops = 0
         var stageCount = [UInt8](repeating: 0, count: objectCount)
-        /// Descending hint for the staging search. Reset whenever clusters are released, so it
+        /// Ascending hint for the staging search. Reset whenever clusters are released, so it
         /// never hides space; without it every stage rescans the whole volume.
-        var spareCursor = lastCluster
+        var spareCursor = spareFloor
         /// Objects worth testing this generation. Anything else is waiting on a cluster that has
         /// not moved, so re-testing it would be wasted work.
         var wake = remaining
@@ -224,7 +246,9 @@ enum RelocationPlanner {
                 for index in blockers where stageCount[index] < Self.maxStagesPerObject {
                     guard !atHome[index], Int(length[index]) <= spareBudget else { continue }
                     guard let staging = spareClusters(count: Int(length[index]), owner: owner.span,
-                                                      cursor: &spareCursor) else { continue }
+                                                      homeOwnerAt: homeOwnerAt.span,
+                                                      cursor: &spareCursor,
+                                                      lastCluster: lastCluster) else { continue }
                     stageCount[index] += 1
                     generation.append(Relocation(objectIndex: index,
                                                  destination: staging,
@@ -244,7 +268,9 @@ enum RelocationPlanner {
                     // always advances, and only give up when even that is impossible.
                     for index in remaining where stageCount[index] < Self.maxStagesPerObject && !atHome[index] {
                         guard let staging = spareClusters(count: Int(length[index]), owner: owner.span,
-                                                          cursor: &spareCursor) else { continue }
+                                                          homeOwnerAt: homeOwnerAt.span,
+                                                          cursor: &spareCursor,
+                                                          lastCluster: lastCluster) else { continue }
                         stageCount[index] += 1
                         generation.append(Relocation(objectIndex: index,
                                                      destination: staging,
@@ -291,7 +317,7 @@ enum RelocationPlanner {
                     nextWake.append(Int(waiting))
                 }
             }
-            spareCursor = lastCluster
+            spareCursor = spareFloor
 
             generations.append(generation)
             remaining.removeAll { atHome[$0] }
@@ -307,15 +333,22 @@ enum RelocationPlanner {
 
         // 3. Anything that could not reach its ideal home is still worth putting in one piece: a
         //    contiguous file that is not compacted loads just as fast as one that is.
+        //
+        //    Placed from the spare floor upwards, and unlike staging this decides where the object
+        //    *lives* rather than where it waits. Taken from the top, a salvaged object left permanent
+        //    data at the far end of the volume and so guaranteed the free space was not one run —
+        //    which is half of what this tool claims and what `Testing/contiguity.py` checks. From the
+        //    floor it extends the compacted region instead, and the tail stays a single run.
         var stranded = unplaceable.filter { !current[$0].isContiguous }
-        var salvageCursor = lastCluster
+        var salvageCursor = spareFloor
         while !stranded.isEmpty {
             var generation: [Relocation] = []
             vacated.removeAll(keepingCapacity: true)
             var stillStranded: [Int] = []
             for index in stranded {
                 guard let run = freeRun(count: UInt32(length[index]), owner: owner.span,
-                                        cursor: &salvageCursor) else {
+                                        homeOwnerAt: homeOwnerAt.span,
+                                        cursor: &salvageCursor, lastCluster: lastCluster) else {
                     stillStranded.append(index)
                     continue
                 }
@@ -332,7 +365,7 @@ enum RelocationPlanner {
                 owner[Int(entry.cluster)] = free
                 freeCount += 1
             }
-            salvageCursor = lastCluster
+            salvageCursor = spareFloor
             generations.append(generation)
             stranded = stillStranded
         }
@@ -395,49 +428,63 @@ enum RelocationPlanner {
         return nil
     }
 
-    /// Any `count` spare clusters, taken from the top downwards so staged data stays clear of the
-    /// low clusters the layout is filling. Contiguity is not required — this is somewhere to wait,
-    /// not somewhere to live. `cursor` carries the search position between calls, which is what
-    /// stops each stage from rescanning the volume.
-    private static func spareClusters(count: Int, owner: Span<Int32>,
-                                      cursor: inout UInt32) -> ClusterSet? {
+    /// The lowest `count` clusters that are free and that no object's home covers — so, the closest
+    /// somewhere-to-wait that cannot be somewhere another object is waiting for.
+    ///
+    /// Two conditions rather than one, and the second is the whole of the safety argument. A free
+    /// cluster below the layout's reach is a cluster some object is on its way to, and parking there
+    /// would deadlock exactly the object whose home it is; a free cluster no home covers can never be
+    /// wanted by anybody, whatever else the schedule does. Searching upwards is then a matter of
+    /// distance alone, which is what it should have been all along.
+    ///
+    /// Contiguity is not required — this is somewhere to wait, not somewhere to live. `cursor` carries
+    /// the search position between calls, which is what stops each stage from rescanning the volume;
+    /// it is reset by the caller whenever clusters are released, so it can never hide space.
+    private static func spareClusters(count: Int, owner: Span<Int32>, homeOwnerAt: Span<Int32>,
+                                      cursor: inout UInt32, lastCluster: UInt32) -> ClusterSet? {
         guard count > 0 else { return nil }
         var picked: [UInt32] = []
         picked.reserveCapacity(count)
         var cluster = cursor
-        while cluster >= 2 {
-            if owner[Int(cluster)] == free {
+        while cluster <= lastCluster {
+            if owner[Int(cluster)] == free, homeOwnerAt[Int(cluster)] < 0 {
                 picked.append(cluster)
                 if picked.count == count {
-                    cursor = cluster > 2 ? cluster - 1 : 2
-                    return .list(picked.reversed())
+                    cursor = cluster + 1
+                    return .list(picked)
                 }
             }
-            cluster -= 1
+            cluster += 1
         }
         return nil
     }
 
-    /// Highest free run of `count` clusters, with a descending cursor for the same reason.
-    private static func freeRun(count: UInt32, owner: Span<Int32>,
-                                cursor: inout UInt32) -> ClusterSet? {
-        guard count > 0, cursor >= count + 1 else { return nil }
-        var end = cursor
-        while end >= count + 1 {
-            let start = end - count + 1
-            var blocked: UInt32?
-            var cluster = end
-            while cluster >= start {
-                if owner[Int(cluster)] != free { blocked = cluster; break }
-                if cluster == start { break }
-                cluster -= 1
+    /// Lowest free run of `count` clusters holding no cluster any home covers, with an ascending
+    /// cursor for the same reason.
+    ///
+    /// The same shape as `runSkippingBad` above, which is the helper this most resembles now: walk
+    /// from the cursor and, on an obstruction, restart past it. Homes are excluded here as well as in
+    /// `spareClusters`, and it is worth saying why, because unlike there it is not forced. At this
+    /// point every object still away from home is one this schedule gave up on, so handing a salvaged
+    /// object the home of another stranded one would deadlock nothing. What it would do is drop that
+    /// object into the middle of the compacted region, out of the tree order the layout is built in,
+    /// for no gain — so one invariant serves both.
+    private static func freeRun(count: UInt32, owner: Span<Int32>, homeOwnerAt: Span<Int32>,
+                                cursor: inout UInt32, lastCluster: UInt32) -> ClusterSet? {
+        guard count > 0 else { return nil }
+        var start = cursor
+        while start <= lastCluster, lastCluster - start + 1 >= count {
+            var obstruction: UInt32?
+            for cluster in start ..< start + count
+                where owner[Int(cluster)] != free || homeOwnerAt[Int(cluster)] >= 0 {
+                obstruction = cluster
+                break
             }
-            guard let obstruction = blocked else {
-                cursor = start > 2 ? start - 1 : 2
-                return .run(start ..< end + 1)
+            guard let blocked = obstruction else {
+                cursor = start + count
+                return .run(start ..< start + count)
             }
-            guard obstruction > 2 else { return nil }
-            end = obstruction - 1
+            start = blocked + 1
         }
         return nil
     }
