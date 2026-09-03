@@ -283,8 +283,7 @@ Ctrl-C once stops after the batch in flight, leaving a consistent, partly defrag
 later run carries on from. Ctrl-C twice stops immediately; the design survives that too, since it is
 precisely what a power cut does.
 
-That argument is about the *order* writes reach the medium, not about how a table entry is encoded,
-so it holds identically on all three variants. One thing does differ, and it is worth knowing:
+One thing does differ on FAT12, and it is worth knowing:
 
 - **On FAT12, an interrupted run is flagged in the boot record and nowhere else.** The other two
   variants also clear a clean-shutdown bit in FAT entry 1, which is the flag most tools check.
@@ -302,9 +301,9 @@ Two things worth knowing before you point it at something you care about:
 
 ### When the medium itself is the problem
 
-The argument above assumes the device answers honestly, and not all of them do. A read that comes back
-with the wrong bytes is copied faithfully to the right place: the FAT agrees, every pointer agrees,
-`fsck` is content, and the data is wrong. Nothing in the filesystem records that it happened.
+Not all devices report honest transfer size limits. That can lead to a read coming back with the
+wrong bytes, which is then copied faithfully to the right place: the FAT agrees, every pointer
+agrees, `fsck` is content, and the data is wrong. Nothing in the filesystem records that it happened.
 
 Three defences, the first two automatic:
 
