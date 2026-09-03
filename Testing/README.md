@@ -1789,6 +1789,14 @@ That last row is worth keeping in mind when testing this: a *compacted* volume h
 the probe, so the fault only reproduces on a fragmented one. The first attempt at verifying the refusal
 ran against the volume left behind by a successful two-pass run and duly failed to refuse anything.
 
+**And the refusal made an old silence into a bug.** A probe that found nothing wrong reported nothing,
+on the reasonable-sounding grounds that there was nothing to report. Once a run refuses where the test
+cannot be performed, that silence puts a verified figure and an unverifiable one in the same clothes:
+the same device, on a volume with room, printed no line about the test at all — so from outside, the
+test looked as though it were sometimes not needed and the refusal therefore capricious. It was
+reported that way from a real run. A pass now says so, in both the full sweep and a dry run's
+reads-only half, which is one line for the thing a run knows about its own ruler.
+
 ## The card that lied, and how long it took to prove it
 
 A second card produced the same shape of fault *after* the transfer limit was being honoured, and

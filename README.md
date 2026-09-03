@@ -330,6 +330,10 @@ Three defences, the first two automatic:
   taking the fastest. On that reader the answer is 64 KiB, which is also **45% faster** than the size
   it claims.
 
+  The run says what it found either way — including that the stated size was tested and honoured,
+  which used to be reported by saying nothing at all. Against a run that refuses when the test cannot
+  be performed, silence made a verified figure and an unverifiable one look identical.
+
   **Where the test cannot run, neither does the defragmenter.** A volume with no spare run long
   enough to write the pattern into — 640 KiB in one piece, for a device stating 128 KiB — is refused
   before the scan, with nothing written. Free some space and run it again, or pass `--verify-copies`

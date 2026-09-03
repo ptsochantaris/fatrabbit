@@ -245,6 +245,17 @@ final class LineConsumer: EventConsumer {
                 } else if probe.narrowedForSpeed {
                     line("Medium is fastest at \(probe.chosen / 1024) KiB rather than the "
                         + "\(probe.stated / 1024) KiB it accepts, so that is what will be used.")
+                } else {
+                    // A pass used to be silent, on the reasoning that there was nothing to report.
+                    // But the run now *refuses* where this test cannot be performed, and against
+                    // that, silence made a verified figure and an unverifiable one read exactly the
+                    // same: the same device, tested and honest on one volume, produced no line at
+                    // all — and the reasonable conclusion from the outside was that the test is
+                    // sometimes not needed, which would make the refusal capricious rather than
+                    // careful. What the run knows about its own ruler is worth one line either way.
+                    line("Tested \(probe.stated / 1024) KiB transfers in both directions, at every "
+                        + "gap that provokes the fault this checks for, and the medium honoured "
+                        + "them — so the size it states is the size in use.")
                 }
             case .noRoom(let largest, let needed):
                 // Only reachable under --verify-copies now: without it the run refuses rather than
@@ -263,6 +274,12 @@ final class LineConsumer: EventConsumer {
                         + "accepts. Reading at \(probe.chosen / 1024) KiB instead, so that what "
                         + "follows describes the volume rather than the reader. A dry run cannot "
                         + "write, so whether it also mishandles writes is untested.")
+                } else {
+                    // The same argument as above, and the same silence to break: a dry run that
+                    // checked its ruler and a dry run that could not are worth telling apart.
+                    line("Checked that this medium reads back consistently at "
+                        + "\(probe.stated / 1024) KiB. A dry run cannot write, so whether it also "
+                        + "mishandles writes is untested — a real run tests both.")
                 }
             case .dryRun:
                 // A dry run writes nothing, so an unverified transfer size cannot cost anything here
