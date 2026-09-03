@@ -220,6 +220,17 @@ toward the end, but compaction becomes opportunistic — an object that cannot c
 is left where it is, so some gaps survive. On a volume that has drifted rather than shattered, it is
 much less work for nearly the same result.
 
+On a volume too full to move anything aside at all, a default run does both, in two passes: the
+`--fast` layout first, which frees the room a shuffle needs, and then the full one on top of it. It
+says which pass it is on and why, since the figures start again from zero at the second one. That is
+roughly twice the data moved, so it takes about twice as long — and it is the only way that volume
+reaches the layout you asked for, because the run that used to be attempted instead left some data
+parked in scratch space and reported success.
+
+Where even that would not finish cleanly, the run stops before writing anything, says how much space
+is free and how much of it is anywhere useful, and leaves the choice to you: free some space, or ask
+for `--fast` and accept a layout that is contiguous but not ordered.
+
 `--dry-run` still *reads* every source cluster the plan wants to move, which proves the data is
 actually readable before a real run relies on it. The volume still has to be unmounted.
 

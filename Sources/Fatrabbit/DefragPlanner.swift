@@ -12,6 +12,19 @@ struct DefragPlan {
     let orderedFirst: [String]
     let orderedLast: [String]
     let unmatchedNames: [String]
+    /// The same objects, as indices into `ordered`, in the order `--fast` would place them: the order
+    /// they already physically sit in, still bracketed by `--first` and `--last`.
+    ///
+    /// Indices rather than a second array of objects, and that is the point of it. Everything
+    /// downstream — a relocation, an owner table, a generation — names an object by its position in
+    /// `ordered`, so a second *ordering* can be handed to the scheduler while the numbering stays
+    /// exactly as it was. A second array would be a second numbering, and a schedule built against one
+    /// and performed against the other moves the wrong objects.
+    ///
+    /// Present whether or not `--fast` was asked for, because a full run needs it too: a volume with no
+    /// room to shuffle anything aside is defragmented by placing things in this order first, which
+    /// frees the room, and then in `ordered` proper. See `SafeDefragmenter.clearTheWayFirst`.
+    let inPlaceOrder: [Int]
 
     /// Objects whose clusters are not a single run, and the total number of runs they occupy.
     var fragmentedCount: Int { ordered.count { !$0.isContiguous } }
@@ -56,6 +69,18 @@ enum DefragPlanner {
         // The root directory leads where it can move, so that it lands on the first usable cluster.
         let flat: [FSObject] = (movableRoot ? [root] : []) + leading + middle + trailing
 
+        // And the same list in physical order, which under `--fast` is the order above and otherwise
+        // is the alternative a full run may need. Sorted by group for the same reason `--fast` sorts by
+        // group: `--first` and `--last` are instructions about where things go, not suggestions to be
+        // overridden by where they happen to be.
+        var positions = [ObjectIdentifier: Int](minimumCapacity: flat.count)
+        for (index, object) in flat.enumerated() { positions[ObjectIdentifier(object)] = index }
+        let inPlace = (movableRoot ? [root] : [])
+            + leading.sorted { $0.start < $1.start }
+            + middle.sorted { $0.start < $1.start }
+            + trailing.sorted { $0.start < $1.start }
+        let inPlaceOrder = inPlace.compactMap { positions[ObjectIdentifier($0)] }
+
         var used: UInt32 = 0
         var fileCount = 0
         var directoryCount = 0
@@ -74,7 +99,8 @@ enum DefragPlanner {
                           directoryCount: directoryCount,
                           orderedFirst: matchedFirst,
                           orderedLast: matchedLast,
-                          unmatchedNames: unmatched)
+                          unmatchedNames: unmatched,
+                          inPlaceOrder: inPlaceOrder)
     }
 
     /// Depth-first: the object itself, then its whole subtree.

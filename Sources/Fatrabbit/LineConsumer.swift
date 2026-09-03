@@ -338,6 +338,19 @@ final class LineConsumer: EventConsumer {
         case .removed(let object):
             line("  Removing \(object)")
 
+        case .passStarting(let number, let total, let staging):
+            // Said loudly, because the figures below it are about to start again from zero and a reader
+            // who has not been told why will reasonably conclude the run has gone back to the
+            // beginning. The reason belongs here too: nobody asks for two passes, so the run explains
+            // that it is doing what it was asked in the only order this volume allows.
+            announce(staging
+                ? "Pass \(number) of \(total): the layout proper, now that there is room to shift "
+                    + "objects aside and bring them back."
+                : "Pass \(number) of \(total): this volume is too full to shift anything aside, so "
+                    + "this pass moves only what can go straight where it belongs and makes the rest "
+                    + "contiguous. That frees the room the second pass needs.",
+                .normal)
+
         case .interrupted(let immediate):
             interrupted = true
             announce(immediate

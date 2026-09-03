@@ -95,6 +95,12 @@ enum RunEvent: Sendable {
     /// Whole chains rather than a summary of them, because summarising is the consumer's job: pairing
     /// the two gives the spans the copy was actually made of, and taking the ends gives the one-line
     /// version. Either is derivable from this; neither could be recovered from the other.
+    /// A volume too full to shuffle anything aside is defragmented in two passes rather than one: see
+    /// `SafeDefragmenter.clearTheWayFirst`. Announced because everything downstream measures a run
+    /// against a single set of planned figures — the progress bar included — and would otherwise show
+    /// the work starting over with nothing to say why.
+    case passStarting(number: Int, of: Int, staging: Bool)
+
     case relocated(object: String, from: ClusterSet, to: ClusterSet, staged: Bool)
     /// One object was removed rather than moved — `--deMac` clearing macOS metadata.
     case removed(object: String)

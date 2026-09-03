@@ -22,6 +22,25 @@ struct RelocationSchedule {
     let unplaceable: [Int]
     let totalClusters: UInt32
     let temporaryHops: Int
+    /// Objects this schedule would leave sitting on a parking spot when it finished — parked to break
+    /// a deadlock for somebody else's benefit, and never brought home.
+    ///
+    /// Known here, before anything is written, because that is where it is knowable: the schedule is
+    /// built whole in memory, so an object still on a temporary destination at the end of the build
+    /// will still be there at the end of the run. Discovering it afterwards, from the map, is what
+    /// happened once.
+    let abandoned: [Int]
+    /// Where every object would sit once this schedule had been carried out, indexed as `objects` was.
+    ///
+    /// So that a schedule can be planned *on top of* another without either being performed. What
+    /// that answers is the question worth asking when a plan comes back with abandoned objects: would
+    /// a pass that parks nothing leave a volume this one could then finish cleanly? On a 2 GiB volume
+    /// 92% full it does — a `--fast` pass frees 1,872 clusters above the layout where there had been
+    /// none, which is exactly the room parking needs and could not find.
+    let finalLayout: [ClusterSet]
+    /// Clusters that were free *and* above the compacted layout when this was planned — the only space
+    /// a deadlock can be broken with, and so the number that says whether one can be broken at all.
+    let spareAboveLayout: Int
 
     var moveCount: Int { generations.reduce(0) { $0 + $1.count } }
 }
@@ -78,20 +97,27 @@ enum RelocationPlanner {
     /// - Parameter allowStaging: when false, no object is ever parked in spare space to break a
     ///   deadlock, so nothing is copied twice. Whatever cannot reach its home directly is either
     ///   made contiguous elsewhere or left alone — the bargain `--fast` offers.
+    /// - Parameter startingAt: where each object sits at the start, when that is not where it sits on
+    ///   the volume right now. Only a schedule built by this type can supply it — see
+    ///   `RelocationSchedule.finalLayout` — and it is how one plan is costed on top of another without
+    ///   either of them being carried out.
     static func schedule(objects: [FSObject],
                          bad: Set<UInt32>,
                          lastCluster: UInt32,
                          allowStaging: Bool,
-                         report: Reporter) throws(FATError) -> RelocationSchedule {
+                         report: Reporter,
+                         startingAt: [ClusterSet]? = nil,
+                         placingIn placementOrder: [Int]? = nil) throws(FATError) -> RelocationSchedule {
         let clusterCount = Int(lastCluster) + 1
         let objectCount = objects.count
 
         var owner = [Int32](repeating: free, count: clusterCount)
         for cluster in bad where Int(cluster) < clusterCount { owner[Int(cluster)] = unusable }
 
+        let starting = startingAt ?? objects.map(\.chain)
         var length = [Int32](repeating: 0, count: objectCount)
         for index in 0 ..< objectCount {
-            let chain = objects[index].chain
+            let chain = starting[index]
             length[index] = Int32(chain.count)
             for cluster in chain where Int(cluster) < clusterCount {
                 owner[Int(cluster)] = Int32(index)
@@ -108,7 +134,11 @@ enum RelocationPlanner {
         var homeOwnerAt = [Int32](repeating: -1, count: clusterCount)
         var frontier: UInt32 = 2
         var totalClusters: UInt32 = 0
-        for index in 0 ..< objectCount {
+        // Whose home is assigned first gets the lowest clusters, so this order *is* the layout. It is
+        // a parameter rather than the order of `objects` because the numbering has to stay put: every
+        // relocation, owner and generation below names an object by its index, and a run that plans in
+        // one order and performs in another moves the wrong data.
+        for index in placementOrder ?? Array(0 ..< objectCount) {
             let count = UInt32(length[index])
             guard let start = runSkippingBad(count: count, from: frontier,
                                              owner: owner.span, lastCluster: lastCluster) else {
@@ -143,8 +173,21 @@ enum RelocationPlanner {
         var spareFloor: UInt32 = 2
         while spareFloor <= lastCluster, homeOwnerAt[Int(spareFloor)] >= 0 { spareFloor += 1 }
 
+        // How much room a shuffle actually has, which is not the same as how much space is free and is
+        // the figure that explains a schedule stalling. Free space below the layout's reach belongs to
+        // whoever is on their way to it, so parking cannot touch it; only what is free at or above the
+        // floor can be borrowed. Measured on a 2 GiB volume 92% full: 9,534 clusters free and **none**
+        // of them up here, so no deadlock on that volume could be broken at all. A pass that parks
+        // nothing leaves 1,872 of them, which is why one has to come first.
+        var spareAboveLayout = 0
+        if spareFloor <= lastCluster {
+            for cluster in spareFloor ... lastCluster where owner[Int(cluster)] == free {
+                spareAboveLayout += 1
+            }
+        }
+
         // 2. Peel the work into generations.
-        var current: [ClusterSet] = objects.map { $0.chain }
+        var current: [ClusterSet] = starting
         var atHome = [Bool](repeating: false, count: objectCount)
         var remaining: [Int] = []
         for index in 0 ..< objectCount {
@@ -161,6 +204,11 @@ enum RelocationPlanner {
         var unplaceable: [Int] = []
         var temporaryHops = 0
         var stageCount = [UInt8](repeating: 0, count: objectCount)
+        /// Whether an object is currently sitting on a parking spot rather than somewhere it is meant
+        /// to stay. Set when it is parked, cleared by whichever placement gives it a real destination
+        /// — its home, or a salvaged run — so whatever is still set when the build ends is what the
+        /// run would abandon.
+        var parked = [Bool](repeating: false, count: objectCount)
         /// Ascending hint for the staging search. Reset whenever clusters are released, so it
         /// never hides space; without it every stage rescans the whole volume.
         var spareCursor = spareFloor
@@ -204,6 +252,7 @@ enum RelocationPlanner {
                 for cluster in current[index] { vacated.append((cluster, Int32(index))) }
                 current[index] = .run(from: start, count: count)
                 atHome[index] = true
+                parked[index] = false
             }
 
             // Only when nothing could move at all. Staging alongside the placements above is equally
@@ -262,6 +311,7 @@ enum RelocationPlanner {
                     for cluster in current[index] { vacated.append((cluster, Int32(index))) }
                     spareBudget -= staging.count
                     current[index] = staging
+                    parked[index] = true
                     temporaryHops += 1
                 }
 
@@ -285,6 +335,7 @@ enum RelocationPlanner {
                         }
                         for cluster in current[index] { vacated.append((cluster, Int32(index))) }
                         current[index] = staging
+                        parked[index] = true
                         temporaryHops += 1
                         break
                     }
@@ -363,6 +414,9 @@ enum RelocationPlanner {
                 }
                 for cluster in current[index] { vacated.append((cluster, Int32(index))) }
                 current[index] = run
+                // Salvage is a permanent address, not a parking spot: it is where the object lives
+                // from now on, so it settles the debt that parking incurred.
+                parked[index] = false
             }
             if generation.isEmpty { break }
             for entry in vacated where owner[Int(entry.cluster)] == entry.formerOwner {
@@ -378,7 +432,10 @@ enum RelocationPlanner {
         return RelocationSchedule(generations: generations,
                                   unplaceable: unplaceable,
                                   totalClusters: totalClusters,
-                                  temporaryHops: temporaryHops)
+                                  temporaryHops: temporaryHops,
+                                  abandoned: (0 ..< objectCount).filter { parked[$0] },
+                                  finalLayout: current,
+                                  spareAboveLayout: spareAboveLayout)
     }
 
     // MARK: - Cluster helpers

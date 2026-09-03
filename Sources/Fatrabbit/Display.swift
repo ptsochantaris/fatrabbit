@@ -322,7 +322,8 @@ final class Display: EventConsumer, @unchecked Sendable {
                 }
             }
 
-        case .phaseCompleted, .telemetry, .generationCompleted, .commit, .relocated, .removed:
+        case .phaseCompleted, .telemetry, .generationCompleted, .commit, .relocated, .removed,
+             .passStarting:
             // Figures and moments, which reach the frame as words through `lines`.
             break
         }

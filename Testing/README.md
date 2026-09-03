@@ -492,8 +492,9 @@ no overrun at any of the three.
 
 ## Parked data is abandoned on a volume with no room, and the run says it succeeded
 
-**Half fixed. Found by the parked colour on its first real run, 2026-09-03. Parking no longer damages
-what it parks; it still leaves it out of place.**
+**Fixed. Found by the parked colour on its first real run, 2026-09-03.** Parking no longer damages what
+it parks, and a plan that would abandon anything is no longer carried out: see "Two passes, decided
+before anything is written" below.
 
 A 92%-full volume was defragmented on the spinner. It finished in 1m 1s, reported "Moved 4,881 objects /
 7,047 clusters", listed 4,398 it could not place, and passed fsck. The finished frame still had grey in
@@ -548,16 +549,61 @@ up in exchange for never copying anything twice. So the 66% row is not evidence 
 a cheaper plan whose result may well be a worse layout. Settling that needs two real runs and
 `contiguity.py` on the results, not a score.
 
-Three things it suggests, smallest last:
+## Two passes, decided before anything is written
 
-  - **Never abandon.** If the schedule ends with objects parked, they need placing somewhere honest —
-    back where they came from, or contiguously wherever there is room. Data moved for someone else's
-    benefit should not be left worse off than it started.
-  - **Say so up front.** The shape of the free space is known at scan time, and it decides everything:
-    9,534 clusters in 5,469 pieces, largest 48 KiB, is a volume a compacting layout cannot build into.
-    That is worth stating before an hour of copying rather than as a list of failures afterwards.
-  - **Distinguish the two failures at the end.** "Could not defragment" currently covers both "left
-    exactly where it was" and "moved into scratch space and left there", which are not the same news.
+The schedule is built whole, in memory, so which objects a run would abandon is known before the first
+byte is written. `RelocationSchedule.abandoned` says so, and a plan that abandons anything is not
+performed. What happens instead is a second plan, and then a third, all still on paper:
+
+  1. the full layout. If it abandons nothing — every volume with room to work in — it runs, and none of
+     the rest happens.
+  2. otherwise a pass planned exactly as `--fast` plans it, which frees the room the first plan could
+     not find,
+  3. and the full layout again, costed *on top of* that pass through `startingAt:` — one plan built
+     against another's `finalLayout`, neither performed.
+
+If step 3 still abandons something, the run stops before writing anything and says so, naming what is
+free, how much of it is above the layout, and what `--fast` would do instead. It does not quietly
+substitute a lesser result: giving up the layout is the caller's decision.
+
+**The trap here is that `--fast` is not "staging off".** It also lays objects out in the order they
+already sit in, and that is the half that matters — homes near where the data already is can be reached
+directly, homes in tree order cannot, and that is the entire deadlock. Planning step 2 with staging off
+and tree-order homes produced 4,768 moves and got nowhere; planned the way `--fast` plans, the same step
+produces **40,150 moves and leaves nothing fragmented**, matching the real `--fast` run move for move.
+Two orderings therefore have to coexist, and `DefragPlan.inPlaceOrder` is indices into `ordered` rather
+than a second array of objects for a reason: every relocation, owner and generation names an object by
+its index, so a second numbering would perform the right plan on the wrong data.
+
+Measured on the 2 GiB volume 92% full, image, before and after:
+
+| | Before | After |
+| --- | --- | --- |
+| Passes | 1 | 2 (40,150 moves, then 74,949) |
+| Clusters moved | 7,016 | 224,608 |
+| Objects left fragmented | 4,388 | **0** |
+| Objects abandoned | 44 | **0** |
+| Re-planning the result | — | **0 moves in 0 generations** |
+| Wall clock | 9s | 38s |
+
+That last row is the price and it is not small: two passes over a volume is roughly twice the data
+moved, so a run that took a minute on the spinner will take twenty. It buys the layout that was asked
+for on a volume that previously could not produce it — and the run says which pass it is on and why,
+because every figure starts again from zero at the second one.
+
+Verified byte for byte: `fsck_msdos` clean, `fatread.py` before against after with an empty diff across
+60,001 lines, and a dry run on the result planning **0 moves in 0 generations**, which is the only
+statement that actually means "nothing is parked and nothing is left to do".
+
+The refusal path has been seen to render with real numbers — it fired while step 2 was still planned
+the wrong way — but no volume has yet been built that legitimately reaches it. A `small 11` or fuller
+recipe is the way to try.
+
+**Still open: the report does not distinguish the two failures.** "Could not defragment N objects"
+covers both "left exactly where it was" and "moved into scratch space and left there". After this
+change the second cannot happen, so it is cosmetic rather than misleading — but a volume interrupted
+part way through pass one can still end with the first pass's layout and nothing saying that the second
+never ran.
 
 ## The raw node, and nothing else
 

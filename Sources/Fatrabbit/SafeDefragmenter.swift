@@ -186,14 +186,18 @@ final class SafeDefragmenter {
             // than discovered a bit at a time and repeatedly revised.
             report.phase(.scheduling)
             let planningStarted = ContinuousClock.now
-            let schedule = try RelocationPlanner.schedule(objects: objects,
-                                                          bad: volume.badClusters,
-                                                          lastCluster: lastCluster,
-                                                          allowStaging: !fast,
-                                                          report: report)
+            let schedule = try plan(allowStaging: !fast)
             report.post(.phaseCompleted(.scheduling,
                                         elapsed: planningStarted.duration(to: .now)))
-            try execute(schedule)
+
+            // A plan that would end with data parked is not carried out as it stands; see
+            // `clearTheWayFirst`. Decided here, before anything is written, because here is where it
+            // can be decided — the schedule is built whole, so what it would abandon is already known.
+            if schedule.abandoned.isEmpty {
+                try execute(schedule)
+            } else {
+                try clearTheWayFirst(insteadOf: schedule)
+            }
         }
 
         if Interruption.requested {
@@ -332,6 +336,89 @@ final class SafeDefragmenter {
     }
 
     // MARK: - Layout
+
+    /// The plan, worked out in memory and performed by nobody.
+    private func plan(allowStaging: Bool,
+                      startingAt: [ClusterSet]? = nil,
+                      inPlace: Bool = false) throws(FATError) -> RelocationSchedule {
+        try RelocationPlanner.schedule(objects: objects,
+                                       bad: volume.badClusters,
+                                       lastCluster: lastCluster,
+                                       allowStaging: allowStaging,
+                                       report: report,
+                                       startingAt: startingAt,
+                                       placingIn: inPlace ? plan.inPlaceOrder : nil)
+    }
+
+    /// Runs a pass that parks nothing, and then the full one on what it leaves behind.
+    ///
+    /// For the volume that has room for the layout but no room to shuffle anything aside on the way
+    /// there. Parking borrows clusters that are free *and* above the compacted layout, because free
+    /// space below it belongs to whoever is on their way to it; on a 2 GiB volume 92% full there were
+    /// 9,534 clusters free and none at all up there, so no deadlock could be broken. The schedule
+    /// stalled, gave up, and left 45 objects sitting on parking spots — which is what parking without
+    /// a way home looks like.
+    ///
+    /// A pass with staging switched off is the way out, and not as a lesser result: it places
+    /// everything it can reach directly and makes the rest contiguous elsewhere, which on that volume
+    /// left nothing fragmented at all and freed 1,872 clusters above the layout. That is the room the
+    /// full pass needed and could not find, so the full pass then finishes cleanly — 72,795 moves and
+    /// nothing abandoned. Two passes over the volume rather than one, which is a great deal of copying;
+    /// it buys the layout the run was asked for, without leaving anything parked to get it.
+    ///
+    /// Both are costed before either is performed. If the second pass would *still* abandon something
+    /// the run stops here, having written nothing, rather than settling for a result nobody asked for:
+    /// `--fast` is exactly the first pass on its own, and the error says so, but choosing to give up
+    /// the layout is the caller's to make and not this type's.
+    ///
+    /// The second pass is planned again for real rather than reused. Its simulated twin was built
+    /// against where the first pass *said* it would leave things, and re-planning costs about a second
+    /// against the hours this saves being wrong about.
+    private func clearTheWayFirst(insteadOf full: RelocationSchedule) throws(FATError) {
+        // Planned exactly as `--fast` plans it, which is not merely staging switched off: that flag
+        // also lays objects out in the order they already sit in, and *that* is what makes the pass
+        // possible on a volume with no room. Homes near where the data already is can be reached
+        // directly; homes in tree order cannot, which is the whole deadlock. Costed with staging off
+        // as well, so this pass cannot itself park anything.
+        let opening = try plan(allowStaging: false, inPlace: true)
+        let closing = try plan(allowStaging: true, startingAt: opening.finalLayout)
+        guard closing.abandoned.isEmpty else {
+            // The number that explains it rather than the number that merely describes it: what is
+            // free matters far less than where it is.
+            let room = full.spareAboveLayout == 0
+                ? "none of them above the compacted layout, which is the only space a shuffle can "
+                    + "borrow"
+                : "\(full.spareAboveLayout.counted("cluster")) of them above the compacted layout"
+            throw FATError.capacity("""
+            not enough room to defragment this volume without leaving data parked. \
+            \(full.abandoned.count.counted("object")) would be shifted aside to make room for others \
+            and never brought home; a pass that shifts nothing aside first does not clear enough \
+            space to finish either, and would leave \(closing.abandoned.count.counted("object")) \
+            parked in turn. \(freeClusters.counted("cluster")) are free, \(room) — so free some space \
+            and run it again. --fast never shuffles anything aside and so never parks anything: it \
+            will make every object contiguous, but it will not put them in layout order, which is \
+            what the full run is for.
+            """)
+        }
+
+        report.post(.passStarting(number: 1, of: 2, staging: false))
+        try execute(opening)
+
+        // Only if there is still a run to have. An interrupted first pass leaves a consistent volume
+        // that nothing was parked in, so stopping here is a clean ending rather than half a job.
+        guard !Interruption.requested else { return }
+
+        report.phase(.scheduling)
+        let planningStarted = ContinuousClock.now
+        let second = try plan(allowStaging: true)
+        report.post(.phaseCompleted(.scheduling, elapsed: planningStarted.duration(to: .now)))
+        // The simulation said this would come back clean. Believing it over the plan actually in hand
+        // would be the one place in this type where something is taken on trust, so it is checked, and
+        // what happens if it disagrees is what happened to the first pass: keep what is done, stop.
+        guard second.abandoned.isEmpty else { return }
+        report.post(.passStarting(number: 2, of: 2, staging: true))
+        try execute(second)
+    }
 
     /// Executes a schedule worked out in advance. Each generation's destinations are clear before
     /// it starts, so its moves are independent of one another and the whole generation is settled
