@@ -328,8 +328,16 @@ Three defences, the first two automatic:
   So each run writes a deliberately awkward pattern into spare space, reads it back, checks both
   directions, and settles on the largest size the medium actually honours — timing the survivors and
   taking the fastest. On that reader the answer is 64 KiB, which is also **45% faster** than the size
-  it claims. Where the test cannot run, the run says which: either there was no spare room in one
-  piece, or it was a dry run, which cannot write and so checks reads only.
+  it claims.
+
+  **Where the test cannot run, neither does the defragmenter.** A volume with no spare run long
+  enough to write the pattern into — 640 KiB in one piece, for a device stating 128 KiB — is refused
+  before the scan, with nothing written. Free some space and run it again, or pass `--verify-copies`
+  to go ahead now, which checks each span against the medium as it is copied and so catches the same
+  fault a span at a time instead of once at the start. An untested figure used to be accepted with a
+  line saying so, which is the mistake that cost those 338 clusters, made politely. A dry run still
+  proceeds, since it writes nothing, but says that what it reports was measured with an unverified
+  ruler.
 - **`--verify-copies`** checks every span in both directions as it is copied — read twice by
   different routes, and read back off the medium after writing — and stops if the medium contradicts
   itself. It roughly doubles the traffic of the copy phase (+23% of wall clock against an image, more

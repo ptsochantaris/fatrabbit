@@ -306,6 +306,39 @@ extension Fatrabbit {
                 FATVolume.maxTransfer = outcome.chosen
                 probe = .measured(outcome)
             } else {
+                // Nowhere to test in, so the size the device published would have to be taken on
+                // trust. It used to be, with a line saying so — which is the same mistake that cost
+                // 177 files, made politely: the reader that destroyed them published 131,072 twice
+                // over and consistently, and a run that believes the number has no way to find out
+                // otherwise. It fails silently, it fails inside data the volume still points at, and
+                // the first sign of it is an error an hour later.
+                //
+                // So the run stops instead, unless the caller has asked for every span to be checked
+                // as it is copied. That is not a formality: `--verify-copies` reads each destination
+                // straight back off the medium and stops on the first disagreement, which is exactly
+                // the fault the probe exists to find, caught one span at a time instead of once at
+                // the start. Slower, and sound.
+                guard verifyCopies else {
+                    throw FATError.capacity("""
+                    not enough free space in one piece to find out what this device does with a \
+                    \(FATVolume.maxTransfer / 1024) KiB transfer — it needs \
+                    \(TransferProbe.spaceRequired(forStated: stated) / 1024) KiB in one run and the \
+                    largest here is \(found.largest / 1024) KiB.
+
+                    That test is not a formality. A card reader measured during this tool's \
+                    development states a 128 KiB limit, twice over and consistently, and mishandles \
+                    it: one write lands half its payload at the wrong address, reports success, and \
+                    destroys data the volume still refers to. Untested, the published figure is the \
+                    one number in a run whose being wrong is both silent and unrecoverable, so it is \
+                    not taken on trust.
+
+                    Free enough space for the test and run it again, or pass --verify-copies to run \
+                    now — that reads every span straight back off the medium as it is copied and \
+                    stops on the first disagreement, which catches the same fault a span at a time.
+
+                    Nothing has been written.
+                    """)
+                }
                 probe = .noRoom(largestFreeRun: found.largest,
                                 needed: TransferProbe.spaceRequired(forStated: stated))
             }

@@ -247,12 +247,14 @@ final class LineConsumer: EventConsumer {
                         + "\(probe.stated / 1024) KiB it accepts, so that is what will be used.")
                 }
             case .noRoom(let largest, let needed):
-                // Worth saying out loud. The run is about to trust a transfer size nobody checked,
-                // and an unchecked one is what destroyed 177 files on the card this exists for.
+                // Only reachable under --verify-copies now: without it the run refuses rather than
+                // trusting an unchecked transfer size, which is what destroyed 177 files on the card
+                // this exists for. So this says what is standing in for the test, not what is being
+                // assumed in place of it.
                 line("Not enough free space in one piece to test what this medium does with a "
                     + "\(FATVolume.maxTransfer / 1024) KiB transfer — \(largest / 1024) KiB free "
-                    + "against \(needed / 1024) KiB needed — so its own figure is being taken on "
-                    + "trust. Use --verify-copies if the contents matter.")
+                    + "against \(needed / 1024) KiB needed. Its own figure is unverified, so every "
+                    + "span will be read straight back off the medium as it is copied instead.")
             case .readsOnly(let probe):
                 if probe.caughtLying {
                     let broken = probe.attempts.filter { !$0.isSafe }
@@ -262,7 +264,17 @@ final class LineConsumer: EventConsumer {
                         + "follows describes the volume rather than the reader. A dry run cannot "
                         + "write, so whether it also mishandles writes is untested.")
                 }
-            case .dryRun, .notADevice:
+            case .dryRun:
+                // A dry run writes nothing, so an unverified transfer size cannot cost anything here
+                // — but it can make everything below it wrong, since the whole run is reads and the
+                // read half of this fault is the more reproducible of the two. Said rather than
+                // skipped: a report taken with a ruler nobody checked should say which ruler.
+                line("Not enough free space in one piece to check that this medium reads back "
+                    + "consistently at \(FATVolume.maxTransfer / 1024) KiB, so what follows is "
+                    + "taken on the device's own figure. A real run would refuse rather than "
+                    + "trust it.")
+
+            case .notADevice:
                 break
             }
             // Said only where there is one, which is the two variants that keep the root outside the

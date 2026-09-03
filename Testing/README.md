@@ -1763,6 +1763,32 @@ asking what the device would accept.
 
 That ioctl is now taken on every run. It also turned out not to be enough, which is the next section.
 
+## A test that cannot run is not a test that passed
+
+The probe needs a free run long enough to write its pattern into — 640 KiB for a device stating
+128 KiB — and a nearly full volume does not have one. That case used to proceed on the device's own
+figure with a line saying so: *"…so its own figure is being taken on trust. Use --verify-copies if the
+contents matter."* Which is the mistake that cost 338 clusters, made politely. The published figure is
+the one number in a run whose being wrong is silent, lands inside data the volume still refers to, and
+first shows up as a single error an hour later; a line of prose does not make trusting it safe, and it
+puts the decision on a reader who has no way to evaluate it.
+
+A writing run on a device now refuses instead, before the scan, having written nothing. `--verify-copies`
+is the way through — it reads every destination straight back off the medium and stops on the first
+disagreement, catching the same fault a span at a time rather than once at the start — and freeing
+space is the other. Verified on the spinner, on the 92%-full volume, all four routes:
+
+| Route | What happens |
+| --- | --- |
+| writing run, no flags | refuses, exit 1, nothing written, 48 KiB free against 640 KiB needed |
+| `--verify-copies` | proceeds, saying the check stands in for the test |
+| `--dry-run` | proceeds, saying what follows was measured with an unverified ruler |
+| the same volume defragmented | probe runs normally — its free tail is one 149 MB run |
+
+That last row is worth keeping in mind when testing this: a *compacted* volume has plenty of room for
+the probe, so the fault only reproduces on a fragmented one. The first attempt at verifying the refusal
+ran against the volume left behind by a successful two-pass run and duly failed to refuse anything.
+
 ## The card that lied, and how long it took to prove it
 
 A second card produced the same shape of fault *after* the transfer limit was being honoured, and
