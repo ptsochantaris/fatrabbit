@@ -492,7 +492,8 @@ no overrun at any of the three.
 
 ## Parked data is abandoned on a volume with no room, and the run says it succeeded
 
-**Open. Found by the parked colour on its first real run, 2026-09-03.**
+**Half fixed. Found by the parked colour on its first real run, 2026-09-03. Parking no longer damages
+what it parks; it still leaves it out of place.**
 
 A 92%-full volume was defragmented on the spinner. It finished in 1m 1s, reported "Moved 4,881 objects /
 7,047 clusters", listed 4,398 it could not place, and passed fsck. The finished frame still had grey in
@@ -522,6 +523,30 @@ clusters in **5,469 runs before, 7,136 after**, largest free run three clusters 
 none of them, so the mechanism works whenever homes eventually clear. What has no answer is the case
 where they never do: `RelocationPlanner` parks a blocker, the schedule later gives up with
 `unplaceable`, and nothing puts the parked objects back or notices they are still out there.
+
+**And then the measurement that reframes all of it.** Staging is not merely leaving 45 objects out of
+place on this volume — it is producing a far worse plan than not staging at all. Same volume, same
+build, `plan-score.py` on all four dry runs:
+
+| Plan | Moves | Clusters | Generations | Staged | Transfers | Predicted | Left fragmented |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 92% full, staging on | 4,867 | 7,016 | 30 | 47 | 2,107 | 17s | **4,388** |
+| 92% full, `--fast` | 40,150 | 84,276 | — | 0 | 21,701 | 133s | **0** |
+| 66% full, staging on | 45,295 | 92,677 | 174 | 1,033 | 27,142 | 209s | 0 |
+| 66% full, `--fast` | 41,428 | 81,706 | — | 0 | 20,637 | 135s | 0 |
+
+The first pair is the striking one: with staging the schedule gives up after moving 7,016 clusters and
+leaves 4,388 objects in pieces; without it, it moves 84,276 and leaves none. Staging derails the main
+loop rather than helping it, and how it manages that is not yet explained — generation 1 is identical
+either way, since staging only fires on a stall, and by generation 3 the staged run's productivity has
+collapsed while the unstaged one keeps going for 22 generations.
+
+**What these figures do not measure is what staging is for.** `plan-score.py` prices *performing* a
+plan; it says nothing about the layout that results. Staging exists to get objects to their ideal homes
+— sibling adjacency, a directory immediately before its own files — and `--fast` explicitly gives that
+up in exchange for never copying anything twice. So the 66% row is not evidence against staging: it is
+a cheaper plan whose result may well be a worse layout. Settling that needs two real runs and
+`contiguity.py` on the results, not a score.
 
 Three things it suggests, smallest last:
 
