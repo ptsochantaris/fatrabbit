@@ -41,6 +41,18 @@ enum ClusterState: UInt8, CaseIterable {
     /// ordinary directory data before and is ordinary directory data after — so nothing ever announces
     /// what it becomes. The map puts back what it found; see `BlockMap.taint`.
     case repointed = 6
+    /// Live data, in a place the run never meant it to be. A stalled generation parks whatever is in
+    /// the way in spare space so that something else can take its slot, and the copy is committed like
+    /// any other — the volume points at it, it is the only copy, and it is exactly as safe. It simply
+    /// has another move still to come.
+    ///
+    /// `displaced` before now, which is true as far as it goes: both mean the data is not where the
+    /// run intends to leave it. But `displaced` is where the volume *found* the data, and this is
+    /// somewhere the run put it on purpose and intends to take it away from again, which is the one
+    /// thing on the map that is the tool's own doing rather than the volume's. Told apart, a stall
+    /// reads as what it is; together, the map shows work appearing in the middle of spare space with
+    /// nothing to say where it came from.
+    case staged = 7
 
     /// How many kinds there are, which is the stride of the per-cell tallies. Derived from the cases
     /// rather than written down beside them, so adding a state cannot silently leave every cell's
@@ -104,6 +116,28 @@ enum Palette {
     /// As collected is to reading, this is to repointing: the same family, lighter, so a block drawn
     /// on the repointing background while its write is in flight is still two colours and not one.
     static let repointed: [3 of UInt8] = [133, 170, 213]
+    /// Grey, because parked data is the one thing on the map that is passing through: every other hue
+    /// names something the volume holds, and this names somewhere the run is borrowing.
+    ///
+    /// Grey is also what free space is drawn in, which is the whole difficulty — staging takes its
+    /// room from just above the layout, so this colour appears among free cells by definition and had
+    /// to be told apart from them there or it would be invisible exactly where it happens. Hence the
+    /// light half of the ramp against free's 238, which is near black: the dimmest of these is still
+    /// twice its brightness. It stays above the two flushing shades for the same reason the lighter
+    /// families above do — a grey square on a grey background is one grey rectangle.
+    ///
+    /// A shallow ramp, and deliberately so. The shade says how much of a cell is parked, but a cell
+    /// with any parked data in it is worth seeing whatever the proportion, so the dim end is a shade
+    /// rather than a hiding place. In practice the dim end is the common one: staging borrows spare
+    /// room from just above the layout, and on a volume full enough to stall at all that room is
+    /// single clusters between files rather than an empty stretch.
+    ///
+    /// Which is also why none of the three is one of the greys `Display` writes text in. They were,
+    /// and the dimmest was the frame's own ink: harmless on screen, since a border is a line and a
+    /// cell is a square, but it made the colour census in `screenshot.py` unable to tell a parked
+    /// cell from a length of box — and the census is the one tool that can find a state drawn in a
+    /// handful of frames out of hundreds.
+    static let staged: [3 of UInt8] = [249, 251, 254]
     static let bad: UInt8 = 196
     static let reading: UInt8 = 27
     /// Yellow rather than white: white is what a terminal uses for text, so a write trail in it read
@@ -178,6 +212,11 @@ final class BlockMap: Sendable {
 
         /// Per cell, one count per state, flattened.
         var counts: [UInt32] = []
+        /// The same tallies for the volume as a whole, so a question about all of it — is there any
+        /// of this on the volume at all? — is answered without summing a few thousand cells. Kept
+        /// alongside `counts` rather than derived from it because it survives a resize unchanged:
+        /// how the clusters are grouped has nothing to do with what they hold.
+        var totals: [UInt32] = []
         /// What each cell is busy with, and how many frames of flash it has left. One pair rather than
         /// an array per kind: a cell is doing one thing at a time, and the latest touch is the
         /// interesting one — a destination being written was read from somewhere else, not here.
@@ -207,6 +246,8 @@ final class BlockMap: Sendable {
             self.clusterCount = clusterCount
             self.cellCount = cellCount
             state = [UInt8](repeating: ClusterState.free.rawValue, count: clusterCount)
+            totals = [UInt32](repeating: 0, count: ClusterState.count)
+            totals[Int(ClusterState.free.rawValue)] = UInt32(clusterCount)
             rebuild()
         }
 
@@ -230,6 +271,8 @@ final class BlockMap: Sendable {
             let base = cell(ofIndex: index) * ClusterState.count
             counts[base + Int(old)] -= 1
             counts[base + Int(newState.rawValue)] += 1
+            totals[Int(old)] -= 1
+            totals[Int(newState.rawValue)] += 1
         }
 
         /// Lights the cell holding `cluster` for as long as the operation lasts.
@@ -325,7 +368,8 @@ final class BlockMap: Sendable {
             let collected = counts[base + Int(ClusterState.collected.rawValue)]
             let written = counts[base + Int(ClusterState.written.rawValue)]
             let repointed = counts[base + Int(ClusterState.repointed.rawValue)]
-            let used = file + displaced + collected + written + repointed
+            let staged = counts[base + Int(ClusterState.staged.rawValue)]
+            let used = file + displaced + collected + written + repointed + staged
             guard used > 0 else { return Palette.free }
 
             // Brightness by how full the cell is, hue by what dominates it — except that work still
@@ -355,6 +399,15 @@ final class BlockMap: Sendable {
             if collected > 0 {
                 return Palette.collected[min(Int(collected * 3 / max(moving, 1)), 2)]
             }
+            // Read on presence, like the stages above it, and for the same arithmetic reason rather
+            // than because it is one: staging is capped at a couple of hundred objects of a few
+            // clusters each, so in a cell covering tens or hundreds of clusters it is never a
+            // majority of anything and asking it to dominate would mean it never appeared. It is
+            // also the only colour that says the run put data somewhere it means to take it away
+            // from again, which is worth more than the difference between the two hues it covers —
+            // both of which mean "not final", so nothing about the outstanding work is lost by
+            // showing this instead.
+            if staged > 0 { return Palette.staged[min(Int(staged * 3 / used), 2)] }
             if displaced * 4 >= used { return Palette.displaced[shade] }
             return Palette.file[shade]
         }
@@ -493,6 +546,16 @@ final class BlockMap: Sendable {
             }
             return result
         }
+    }
+
+    /// Whether any of the volume is in `state` at present.
+    ///
+    /// For the key, which has less room than anything else in the frame: a colour that is on the map
+    /// needs explaining, and one that is not is a line of explanation crowding out the entries that
+    /// identify something. Only `staged` asks — the rest are either always present or, like `bad`,
+    /// worth naming precisely because they are usually absent.
+    func holds(_ state: ClusterState) -> Bool {
+        storage.withLock { $0.totals[Int(state.rawValue)] > 0 }
     }
 
     /// Re-aggregates into a different number of cells, which is what a resized window needs. The

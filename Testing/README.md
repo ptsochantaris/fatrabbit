@@ -438,6 +438,102 @@ newly added state renders as empty volume — the measuring tool reporting a fau
 measured, which is the worst direction for a mistake to run. Its printed key had been missing `written`
 since that state was added.
 
+## Parked data is a category, and the default recipe cannot show it
+
+`staged` is the one content colour that is neither a stage nor where the volume put the data: a stalled
+generation parks whatever is in the way in spare room, commits it like any other copy, and comes back
+for it later. It was drawn as `displaced` — true, in that neither is final, but it hid the one thing on
+the map that is the tool's own doing, so a stall showed as work appearing in the middle of spare space
+with nothing to say where it came from.
+
+**Which volume you use decides whether you see it at all, and rebuilding one is not the same as keeping
+it.** `spin-fragmented.img`, the kept snapshot every figure here is against, stages **1,033 hops across
+174 generations** — grey for most of the run, and every one of them brought home. A `small 7` volume
+rebuilt today on an image stages **six**, all in generation 47 of 48, into fifteen clusters about one
+cell wide, living from one commit to the next: under a millisecond on an image, and on the spinner, over
+a 5m 36s run, it landed in **none of 2,675 frames**. Same recipe, same scale, two orders of magnitude
+apart — which is "The filesystem driver writes the test volume" again, and the reason that section says
+not to rebuild a snapshot you still have. A capture with no grey in it says nothing about whether grey
+works; check which volume produced it first.
+
+**`small 10` is the recipe for the pathological end.** 92% full, 60,070 files, and the planner stalls in
+generation 16 of 29 — 46 hops parked into 121,987…125,546, which then stay there: **44 of the 46 are
+never brought home**, and the run reports success. That is the finding the colour produced on its first
+real outing, and it has its own section below. On the spinner it is 17 frames of 497, 26 cells in a
+single row, every one at the dim end of the ramp:
+
+    newfs_msdos -F 32 -c 32 -s 4194304 -v PARKTEST /dev/rdiskN   # then mount, and:
+    python3 make-test-volume.py /Volumes/PARKTEST small 10        # 2m on an SSD image
+    dd if=/dev/rdiskN of=~/Documents/fatrabbit-snapshots/parked-full.img bs=4m
+
+    dd if=~/Documents/fatrabbit-snapshots/parked-full.img of=/dev/rdiskN bs=4m
+    python3 ptyrun.py 140 45 spin.cap ./fatrabbit --no-pause /dev/rdiskN
+    python3 screenshot.py spin.cap 140 45 486      # 's' among the 'F's, near the frontier
+
+The dim end being the common one is worth expecting rather than discovering: staging borrows from just
+above the layout, and a volume full enough to stall has single free clusters between files there rather
+than an empty stretch, so the cells it lands in are mostly settled data with one parked cluster in them.
+That is also why the hue is taken on presence — asked to dominate a cell, it would never appear at all.
+
+**A content colour must avoid the greys the frame writes text in.** Grey is right for something passing
+through, and it is also what free space is drawn in, so the ramp has to sit in the light half — 249
+against free's 238, which is near black. The first attempt started at 250, which is `frameInk`: fine on
+screen, since a border is a line and a cell is a square, and useless in a census, where 26 parked cells
+and 546 characters of box are the same number. 244, 247, 253 and 255 are the other text inks, and 239
+and 245 are the flushing pulse a parked cell can be drawn on top of. What is left is 249, 251, 254.
+
+**The key names it only while it is on the map.** Every other entry is unconditional, and this one
+cannot be: staging happens on a stalled volume and on no other, so on most runs an unconditional entry
+would spend the narrowest row in the frame explaining a colour that is nowhere on screen — and spend it
+on the entries this row already drops. `BlockMap.holds(_:)` answers from a running per-state total, so
+the question costs nothing per frame. Checked at 60, 80 and 100 columns with parked data present: the
+key fills the row exactly and drops activity entries in the documented order, `screenshot.py` reporting
+no overrun at any of the three.
+
+## Parked data is abandoned on a volume with no room, and the run says it succeeded
+
+**Open. Found by the parked colour on its first real run, 2026-09-03.**
+
+A 92%-full volume was defragmented on the spinner. It finished in 1m 1s, reported "Moved 4,881 objects /
+7,047 clusters", listed 4,398 it could not place, and passed fsck. The finished frame still had grey in
+it, which should be impossible: parked data exists to be fetched back, and there was nothing left to
+fetch it. The map was right.
+
+    staged hops: 46
+    never brought home: 44
+
+Reproduce it from the plan alone — no device, no writing, about a second:
+
+    fatrabbit -n --verbose ~/Documents/fatrabbit-snapshots/parked-full.img > v.txt
+    # for each "(staged)" line, look for a later line whose source is that destination
+
+What it costs the objects it happens to is the part that matters, because it is not merely a position:
+
+    file F11.BIN: 23…25 → 124998…125268 (staged)
+          23…23 → 124998…124998
+          24…25 → 125267…125268
+
+F11.BIN arrived as three contiguous clusters. It was parked as two extents 269 apart, to break a
+deadlock for somebody else's benefit, and left that way. It is in the "4398 objects still fragmented"
+count, with nothing to say that the run is what fragmented it. Free space came out worse too: 9,534
+clusters in **5,469 runs before, 7,136 after**, largest free run three clusters either side.
+
+**It is a too-full volume, not staging.** The kept 66%-full snapshot stages 1,033 objects and abandons
+none of them, so the mechanism works whenever homes eventually clear. What has no answer is the case
+where they never do: `RelocationPlanner` parks a blocker, the schedule later gives up with
+`unplaceable`, and nothing puts the parked objects back or notices they are still out there.
+
+Three things it suggests, smallest last:
+
+  - **Never abandon.** If the schedule ends with objects parked, they need placing somewhere honest —
+    back where they came from, or contiguously wherever there is room. Data moved for someone else's
+    benefit should not be left worse off than it started.
+  - **Say so up front.** The shape of the free space is known at scan time, and it decides everything:
+    9,534 clusters in 5,469 pieces, largest 48 KiB, is a volume a compacting layout cannot build into.
+    That is worth stating before an hour of copying rather than as a list of failures afterwards.
+  - **Distinguish the two failures at the end.** "Could not defragment" currently covers both "left
+    exactly where it was" and "moved into scratch space and left there", which are not the same news.
+
 ## The raw node, and nothing else
 
 Every device run goes through `/dev/rdiskN`; a buffered path given on the command line is redirected

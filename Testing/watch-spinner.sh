@@ -10,16 +10,27 @@
 # are directly comparable — this one just takes minutes rather than seconds, which is much closer to
 # what a card does.
 #
-# Nothing this script needs lives in /tmp except the binary and the scratch listing, both of which it
-# makes. That is deliberate: /tmp went away in an OS upgrade and took the script and the 2 GiB snapshot
-# with it, and a rebuilt snapshot is not the same volume — see "The filesystem driver writes the test
-# volume" in README.md. Losing it invalidates every absolute figure and leaves an A/B with nothing to
-# compare against, so it lives outside /tmp and the script says so loudly if it is missing.
+# FR_SNAPSHOT restores a different volume, for the runs that volume cannot show:
+#
+#   FR_SNAPSHOT=~/Documents/fatrabbit-snapshots/parked-full.img Testing/watch-spinner.sh
+#
+# That one is 92% full and stalls in generation 16 of 29, which is the only way to watch data being
+# parked in spare space — the default volume has room enough to stage six objects in its
+# second-to-last generation, and they are drawn for about a millisecond. See "Parked data is a
+# category, and the default recipe cannot show it" in README.md. Every absolute figure recorded in
+# that file is against the default, so leave it alone when measuring.
+#
+# Nothing this script needs lives in /tmp except the scratch listing, which it makes. That is
+# deliberate: /tmp went away in an OS upgrade and took the script and the 2 GiB snapshot with it, and
+# a rebuilt snapshot is not the same volume — see "The filesystem driver writes the test volume" in
+# README.md. Losing it invalidates every absolute figure and leaves an A/B with nothing to compare
+# against, so it lives outside /tmp and the script says so loudly if it is missing.
 #
 # The scratch directory is created rather than assumed, which is not a formality: /tmp is emptied on
 # some upgrades and by some reboots, and without the mkdir the *first* run afterwards died at the link
 # step with "no such file or directory" for the binary — the one run where you are least expecting the
-# harness itself to be the thing that broke.
+# harness itself to be the thing that broke. The binary itself now comes from the package's own
+# .build, which is inside the working tree and outlives nothing being emptied.
 #
 # The device is looked up by volume name, and that is not fastidiousness. This script used to say
 # /dev/rdisk14, which was true for as long as one session lasted; after an OS upgrade and reboot
@@ -57,8 +68,7 @@ set -e
 SOURCE="$HOME/Documents/fatrabbit"
 SNAPSHOTS="$HOME/Documents/fatrabbit-snapshots"
 SCRATCH=/tmp/fp
-BINARY="$SCRATCH/fatrabbit-current"
-SNAPSHOT="$SNAPSHOTS/spin-fragmented.img"
+SNAPSHOT="${FR_SNAPSHOT:-$SNAPSHOTS/spin-fragmented.img}"
 VOLUME=SPINTEST
 
 mkdir -p "$SCRATCH"
@@ -111,22 +121,24 @@ if [ ! -f "$SNAPSHOT" ]; then
     echo "    python3 $SOURCE/Testing/make-test-volume.py /Volumes/$VOLUME small 7" >&2
     echo "    diskutil unmount $DISK" >&2
     echo "    dd if=$DEVICE of=$SNAPSHOT bs=1m count=2048" >&2
+    echo "The scale is the shape: 7 is the two-thirds-full volume every figure here is against, and" >&2
+    echo "10 is the 92%-full one that stalls — parked-full.img was built with 10." >&2
     exit 1
 fi
 
 # --- Build from the working tree -------------------------------------------------------------------
 
-NEEDED=no
-[ -x "$BINARY" ] || NEEDED=yes
-if [ "$NEEDED" = no ]; then
-    for f in "$SOURCE"/*.swift; do
-        [ "$f" -nt "$BINARY" ] && NEEDED=yes && break
-    done
-fi
-if [ "$NEEDED" = yes ]; then
-    echo "Building from $SOURCE…"
-    swiftc -O "$SOURCE"/*.swift -o "$BINARY"
-fi
+# Through the package, which is the only thing that can build this any more: the sources moved into
+# Sources/Fatrabbit and swift-argument-parser arrived, so `swiftc -O $SOURCE/*.swift` — what this did
+# before — now matches Package.swift and nothing else, and compiles a manifest into a link error. It
+# also no longer needs the hand-rolled mtime check it had, because the whole reason for that was that
+# swiftc has no idea what it built last time and `swift build` does.
+echo "Building from $SOURCE…"
+make -C "$SOURCE" release
+# Asked for rather than assembled, since the Makefile is where the path is decided. The build above
+# has already happened, so this second call is the echo and a few milliseconds.
+BINARY=$(make -s -C "$SOURCE" run | tail -1)
+[ -x "$BINARY" ] || { echo "Built, but $BINARY is not there to run." >&2; exit 1; }
 
 # --- Restore and run -------------------------------------------------------------------------------
 

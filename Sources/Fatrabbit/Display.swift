@@ -519,7 +519,7 @@ private extension Display.Frame {
         }
 
         // The key belongs with the thing it explains, on the last row inside the map panel.
-        result.append(edge + legendRow(width: inner) + edge)
+        result.append(edge + legendRow(width: inner, staged: map.holds(.staged)) + edge)
 
         result.append(rule(left: unicode ? "├" : "+", right: unicode ? "┤" : "+",
                            label: " \(phaseName) ",
@@ -666,7 +666,13 @@ private extension Display.Frame {
     /// holds and what is being done to it. It is still the first thing dropped when the window is
     /// too narrow, because it explains rather than identifies — so its position and its priority are
     /// decided separately, and activity colours are kept in preference to it.
-    func legendRow(width: Int) -> String {
+    ///
+    /// - Parameter staged: whether any of the volume is parked in spare space, which decides whether
+    ///   its grey is named. The only entry drawn conditionally, and the condition is the point:
+    ///   staging happens on a stalled volume and on no other, so on most runs an unconditional entry
+    ///   would spend the narrowest row in the frame explaining a colour that is nowhere on screen —
+    ///   and it would be spending it on the entries this row already has to drop.
+    func legendRow(width: Int, staged: Bool) -> String {
         let dot = unicode ? "●" : "*"
         let gap = 3
 
@@ -693,10 +699,15 @@ private extension Display.Frame {
             Entry(swatch: "\u{1B}[48;5;\(colour)m  ", cells: 2, label: label)
         }
 
-        let held = [contents("In place", Palette.file),
-                    contents("To move", Palette.displaced),
-                    contents("Free", [Palette.free]),
-                    contents("Bad", [Palette.bad])]
+        // Parked sits with the other thing that is not final, and ahead of the two cheap entries a
+        // reader can more nearly guess at. Named for the situation rather than for the mechanism,
+        // as the two above it are — "In place" and "To move" say where data stands, and the log
+        // lines are where the word staging belongs.
+        var held = [contents("In place", Palette.file),
+                    contents("To move", Palette.displaced)]
+        if staged { held.append(contents("Parked", Palette.staged)) }
+        held += [contents("Free", [Palette.free]),
+                 contents("Bad", [Palette.bad])]
         let doing = [activity("Reading", Palette.reading),
                      activity("Writing", Palette.writing),
                      activity("Repointing", Palette.repointing),

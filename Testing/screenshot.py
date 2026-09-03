@@ -44,6 +44,7 @@ LETTERS = {238: '.',
            25: 'k', 32: 'K', 39: 'K',
            148: 'n', 184: 'N', 226: 'N',
            133: 'g', 170: 'G', 213: 'G',
+           249: 's', 251: 'S', 254: 'S',
            196: 'X'}
 
 # Activity is a background behind the contents, so a busy cell reports both.
@@ -343,7 +344,7 @@ def main():
           f'{"frame " + str(wanted) if wanted else "the last"} ---')
     print(text)
     print('--- the grid as letters: . free  f/F in place  m/M to move  k/K collected  '
-          'n/N written  g/G repointed  X bad, '
+          'n/N written  g/G repointed  s/S parked  X bad, '
           'and where busy: r read  w write  p repoint  c clear ---')
     for line in letters:
         print(line)

@@ -447,8 +447,10 @@ final class SafeDefragmenter {
         //    Copied in the largest spans where source and destination are both unbroken, rather
         //    than a cluster at a time: the destination is always one run, so a source that is in
         //    one piece becomes a single read and a single write however many clusters it is.
-        // Parked in spare space rather than housed, so it still has a move to come.
-        let destinationState: ClusterState = temporary ? .displaced : .file
+        // Parked in spare space rather than housed, so it still has a move to come — and said as
+        // that rather than as ordinary work outstanding, since the run put it here itself and means
+        // to come back for it.
+        let destinationState: ClusterState = temporary ? .staged : .file
         // Both of the things the volume cannot work out for itself. A parked copy exists only to be read
         // back; a directory's clusters are read again the moment anything is pointed at them — every
         // child's `..`, the dot-entry check at the end, and every pointer flip that lands in them.
