@@ -403,6 +403,17 @@ final class LineConsumer: EventConsumer {
 
         case .verifying:
             let count = latest.directoriesToVerify
+            // A dry run reaches this phase and has nothing it can do in it: the check reads a
+            // directory back from where it was moved to, and a dry run moved nothing. Said out
+            // loud, and with the count it would have checked, because a pass that did not run reads
+            // as a pass that passed if it says nothing at all. No live line either — there is no
+            // progress to report through.
+            guard setup?.dryRun != true else {
+                line("Not reading back the \"./..\" entries of \(count) relocated "
+                    + "\(count.word("directory", "directories")): a dry run writes nothing, so "
+                    + "there is nothing at the far end to read.")
+                return
+            }
             line("Verifying \"./..\" entries of \(count) relocated "
                 + "\(count.word("directory", "directories"))…")
             live = .verifying
@@ -438,16 +449,14 @@ final class LineConsumer: EventConsumer {
                 + "averaging \(rate(clusters: latest.clustersDone, of: clusterSize, over: elapsed)).")
 
         case .verifying:
+            // Nothing to add on a dry run: the phase announced that it was not reading anything
+            // back, and "All correct" below would be a claim about reads that never happened. The
+            // note that used to sit here — a count of corrections, labelled as meaningless — is
+            // gone with the pass that produced it; see `repairDotEntries`.
+            guard setup?.dryRun != true else { return }
             let fixed = latest.staleDotEntriesFixed
             if fixed > 0 {
-                // On a dry run the moves never landed, so these were read back from clusters still
-                // holding whatever was there before: nearly every relocated directory looks stale. Say
-                // so rather than presenting a count that means nothing.
-                line("Corrected \(fixed) stale \".\"/\"..\" \(fixed.word("entry", "entries"))."
-                    + (setup?.dryRun == true
-                        ? " (Dry run: read from clusters the moves never updated, so this count is"
-                            + " not meaningful.)"
-                        : ""))
+                line("Corrected \(fixed) stale \".\"/\"..\" \(fixed.word("entry", "entries")).")
             } else {
                 line("  All correct (\(elapsed.readable)).")
             }

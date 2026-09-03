@@ -663,6 +663,31 @@ final class SafeDefragmenter {
             return
         }
 
+        // Not on a dry run, and the reason is the check below rather than the writing. That check
+        // asks whether a directory's data reached its new home, and on a dry run nothing reached
+        // anywhere by design — so it is being asked a question whose answer is settled before it
+        // starts, and the answer it gives is that a healthy volume has lost every directory that
+        // moved. Measured on the 2 GiB volume: `-n` stopped with "Filesystem corruption" at the
+        // first of 2,115 relocated directories, on a volume that then defragmented and passed fsck.
+        //
+        // This was survivable once. A mismatch here used to correct the entry, so a dry run produced
+        // a count of corrections that meant nothing, and the report said as much rather than
+        // presenting it. Then the pass was hardened to stop rather than patch — which is right, and
+        // came from four directories on a card being overwritten with the fingerprint of their own
+        // repair — and the case that was merely meaningless became a run that fails. The
+        // accommodation was in the wording, where it could no longer be reached; it belongs here,
+        // where the pass decides whether it has anything to check.
+        //
+        // The half above still runs, because it needs no reads: it compares what the scan found
+        // against what the layout leaves, so a dry run still reports the pre-existing damage a real
+        // run would repair.
+        guard !volume.dryRun else {
+            report.update { $0.directoriesToVerify = moved.count }
+            report.phase(.verifying)
+            report.post(.phaseCompleted(.verifying, elapsed: .zero))
+            return
+        }
+
         report.update { $0.directoriesToVerify = moved.count }
         report.phase(.verifying)
         let started = ContinuousClock.now

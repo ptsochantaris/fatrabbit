@@ -1890,6 +1890,35 @@ OS driver together, against a cache that may still hold what was there before th
 it drags in `.fseventsd` and `.Spotlight-V100`, which macOS rewrites on every mount, so a
 comparison of mounted trees fails for reasons that have nothing to do with the volume.
 
+### A dry run cannot verify what it did not write
+
+`-n` used to end with `Error: Filesystem corruption: dir SPOTLI~1 is at cluster 7 … the medium holds
+no directory there`, on the two-thirds-full measurement volume, which then defragmented and passed
+fsck. Both of the obvious readings are wrong: it is not the volume, and it is not a regression. The
+same message, the same cluster and the same first eleven bytes came out of the build from before the
+block-map work, and it happens with `--fast` too, so staging is not involved either.
+
+`repairDotEntries` reads a moved directory back and refuses to patch anything into a first cluster
+that does not begin with `.` and `..`. That check earns its keep — it came from four directories on a
+card being overwritten with the fingerprint of their own repair — and its signature is *a destination
+that was never written*, which on a dry run is every destination there is. So it fired at the first
+relocated directory of 2,115 and called a healthy volume corrupt.
+
+The case had been seen before and accommodated in the wrong place. When a mismatch merely corrected
+the entry, a dry run produced a count of corrections that meant nothing, and the report labelled it as
+meaningless; hardening the pass to stop rather than patch left that wording unreachable and turned a
+harmless lie into a failed run. The accommodation now lives in the pass, which skips the read-back
+sweep on a dry run and says so, and the comparison half — pre-existing damage, which needs no reads —
+still runs and still reports what a real run would repair.
+
+Two things were considered and rejected. Letting the cache take what a dry run pretends to write
+removes a branch from `deviceWrite` but does not fix it: the cache exists only for raw character
+devices (`System.isUncached`), so `fatrabbit card.img` and any buffered node have none, and the same
+error comes out — verified on the image file directly. Where the cache *is* on it would be worse than
+useless, because the sweep would then read back the run's own memory and pass by being vacuous, which
+is the opposite of what the check is for. And it would leave the cache holding bytes the medium does
+not contain, which is the one thing its whole correctness argument rests on not doing.
+
 ## Baseline the medium first
 
     python3 medium-baseline.py /dev/rdisk14s1
